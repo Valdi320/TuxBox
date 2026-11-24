@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 import unittest
 import unittest.mock
 
-from tools.triage_scarlett_shaders import command, construct, main, normalize, probe, requests
+from tools.triage_scarlett_shaders import command, construct, main, normalize, probe, requests, triage_log
 
 KEY = "ab" * 32
 
@@ -61,6 +61,48 @@ class TriageScarlettShaders(unittest.TestCase):
         for name in (f"{KEY}.dxbc", f"{KEY}_rt1.stencil", "notes.dxbc", f"{KEY}.cso"):
             (self.cache / name).write_bytes(b"")
         self.assertEqual([p.name for p in requests(self.cache)], [f"{KEY}.dxbc", f"{KEY}_rt1.stencil"])
+
+    def test_log_groups_unique_keys_and_preserves_literal_sampler_states(self):
+        a, b, c, d = ("1" * 64, "2" * 64, "3" * 64, "4" * 64)
+        def refusal(key, reason):
+            return f"[TuxBox 2026-11-24T07:37:00+00:00] Xbox shader {key}: xshader failed (65): {reason}\n"
+
+        wave = "wave reduction at 0x40 may execute in divergent control flow"
+        sampler = "mimg at 0x90: s20 not a sampler descriptor (Some(InlineWord(146))) words [0x92, 0xc00000, 0x14500000, 0x0]"
+        lines = [
+            refusal(a, wave),
+            refusal(a, wave.replace("0x40", "0x50")),
+            refusal(b, wave),
+            refusal(c, sampler),
+            refusal(d + "_rt3", sampler.replace("0x14500000", "0x18500000")),
+            refusal("invalid-key", wave),
+            refusal("5" * 64, wave).replace("failed (65)", "failed (1)"),
+            f"Compiled Xbox shader {a}",
+        ]
+        report = triage_log(lines, 1)
+        self.assertEqual(report["totals"], {"refused": 4, "refusal_events": 5})
+        self.assertEqual({row["construct"]: row["count"] for row in report["constructs"]},
+                         {"mimg": 2, "wave reduction": 2})
+        self.assertEqual(len(report["sampler_states"]), 2)
+        self.assertEqual(report["sampler_states"][0]["words"],
+                         ["0x92", "0xc00000", "0x14500000", "0x0"])
+        self.assertTrue(all(len(row["examples"]) == 1 for row in report["reasons"]))
+
+        log = self.root / "scarlett.log"
+        log.write_text("".join(lines))
+        output = self.root / "report.json"
+        with redirect_stdout(io.StringIO()) as stdout:
+            self.assertEqual(main(["--log", str(log), "--json", str(output)]), 0)
+        self.assertIn("Observed refusals: 4 distinct keys, 5 log events.", stdout.getvalue())
+        self.assertIn("Not a coverage estimate", stdout.getvalue())
+        self.assertEqual(json.loads(output.read_text())["totals"], report["totals"])
+
+    def test_log_uses_the_last_observed_refusal(self):
+        lines = [f"Xbox shader {KEY}: xshader failed (65): first reason",
+                 f"Xbox shader {KEY}: xshader failed (65): second reason"]
+        report = triage_log(lines, 3)
+        self.assertEqual(report["totals"], {"refused": 1, "refusal_events": 2})
+        self.assertEqual(report["reasons"][0]["reason"], "second reason")
 
     def test_ranks_refusals_and_separates_failures(self):
         names = {"1" * 64: 0, "2" * 64: 65, "3" * 64: 65, "4" * 64: 65, "5" * 64: 1}
