@@ -61,6 +61,27 @@ class CompareScarlett(unittest.TestCase):
         self.assertEqual(len(list(self.requests.iterdir())), 6)
         self.assertEqual(result["tool_sha256"]["baseline"], hashlib.sha256(b"baseline").hexdigest())
 
+    def test_expected_status_gate_and_strict_failures(self):
+        source = self.request(b"input")
+        expected = self.root / "expected.json"
+        expected.write_text(json.dumps({source.name: {"status": "compiled"}}))
+        args = [str(self.requests)]
+        for name, path in zip(("baseline", "candidate", "dxc", "dxv"), self.tools):
+            args += ["--" + name, str(path)]
+        with patch("tools.compare_scarlett_shaders.compile_one", return_value={"status": "failed"}):
+            result = self.root / "mismatch.json"
+            self.assertEqual(main(args + ["--json", str(result), "--expect-candidate", str(expected)]), 1)
+            self.assertEqual(json.loads(result.read_text())["expectation_mismatches"],
+                             [{"request": source.name, "expected": "compiled", "actual": "failed"}])
+            self.assertEqual(main(args + ["--json", str(self.root / "strict.json"), "--require-no-failures"]), 1)
+            expected.write_text(json.dumps({source.name: {"status": "failed"}}))
+            self.assertEqual(main(args + ["--json", str(self.root / "expected-error.json"),
+                                          "--expect-candidate", str(expected)]), 0)
+        expected.write_text("{}")
+        with self.assertRaises(SystemExit), patch("tools.compare_scarlett_shaders.compile_one") as invoke:
+            main(args + ["--json", str(self.root / "missing.json"), "--expect-candidate", str(expected)])
+        invoke.assert_not_called()
+
     def test_real_runtime_pipeline_validates_and_does_not_reuse_cache(self):
         source = self.request(b"synthetic input")
         bitcode = b"BC\xc0\xde"

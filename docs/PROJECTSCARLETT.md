@@ -102,6 +102,9 @@ does not compile with the candidate. The result is shader compilation
 coverage on this exact request set, not proof of rendering or gameplay.
  For a small synthetic smoke comparison without game files, generate a fresh request
 directory with `python tools/reference/scarlett_compare_fixture.py /path/to/new-directory`.
-The two wave controls use the guarded reduction encodings; their acceptance
-depends on the compiler revision. One deliberately invalid input exercises the
-failed category.
+The nine synthetic controls include two valid guarded reductions, two unproven
+guards, verified indexed reads, an unknown stride, two ordinary compute
+programs and a deliberately malformed input. Pass
+`--expect-candidate /path/to/new-directory/expected.json` when testing the
+verified patches to fail if any expected status changes. For a real request
+set use `--require-no-failures` to fail on any inconclusive tool/input error.
