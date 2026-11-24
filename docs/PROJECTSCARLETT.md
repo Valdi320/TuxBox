@@ -81,3 +81,27 @@ The game opens its Americas window, loads its archives and presents 3840×2160 f
 In a new prefix, the game stops at a breakpoint during System Init because it reads its package through the `G:` drive, as on the console, and the launcher doesn't map that drive yet. A fix is in review. [Pull request #6](https://github.com/brcly/TuxBox/pull/6)
 
 When you report a run, include the package version, executable hash, GPU and driver, Proton build, and the log printed in the first line of the launcher's output.
+
+
+### Compare compiler revisions without running the game
+
+Use the same recorded request directory for a paired CPU-only comparison,
+with two host xshader executables and the same DXC and DXV:
+
+```sh
+python tools/compare_scarlett_shaders.py /path/to/requests \
+    --baseline /path/to/old/xshader --candidate /path/to/new/xshader \
+    --dxc /path/to/dxc --dxv /path/to/dxv --jobs 2 --json comparison.json
+```
+
+The production compile pipeline verifies the request digests, translates,
+compiles, and validates DXIL in fresh temporary caches. The report separates
+confirmed refusal-to-compiled recoveries, compiled-to-refused regressions,
+and retryable errors. The command returns nonzero if a baseline success
+does not compile with the candidate. The result is shader compilation
+coverage on this exact request set, not proof of rendering or gameplay.
+ For a small synthetic smoke comparison without game files, generate a fresh request
+directory with `python tools/reference/scarlett_compare_fixture.py /path/to/new-directory`.
+The two wave controls use the guarded reduction encodings; their acceptance
+depends on the compiler revision. One deliberately invalid input exercises the
+failed category.
