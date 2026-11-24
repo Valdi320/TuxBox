@@ -241,6 +241,135 @@ four input samples per selector pair and 2,048 mixed chains. No Wine,
 Proton, game or GPU is required. This is not a replacement for subsequent
 dynamic GPU and title-level validation.
 
+### CPU scalar reference and generated semantic tests
+
+The independent reference model (`tools/reference/rdna2_scalar.py`) decodes
+native words and models ordinary integer SGPR operations using the
+[AMD RDNA 2 ISA reference](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
+(SOP1, SOP2 and SOPC). It is intentionally not a complete Xbox GPU simulator.
+The model covers 77 instruction forms, ordinary registers s2..s9, SCC,
+32/64-bit arithmetic, bit operations, shifts, comparisons and conditional
+moves. It rejects unsupported selectors, incomplete programs, uninitialized
+reads, and unsupported instruction classes instead of inventing results.
+It does not simulate memory, textures, wave execution, vector lanes,
+floating point, control flow or hardware timing.
+
+Generate deterministic boundary-value and random programs, including
+overlapping registers and chains. The core profile covers 65 forms accepted
+by the baseline; extended adds the 12 forms proposed in #58.
+
+```sh
+python tools/check_scalar_encodings.py --llvm-mc /path/to/llvm-mc
+python tools/generate_scalar_tests.py /tmp/scalar-corpus --per-op 128 --chains 256
+cargo test --manifest-path tools/shader-compiler/Cargo.toml \
+    --target x86_64-unknown-linux-gnu --lib --no-run
+```
+
+Use the Rust library test executable printed by Cargo (the
+`tuxbox_xshader-...` binary, not the CLI executable):
+
+```sh
+python tools/check_scalar_oracle.py --corpus /tmp/scalar-corpus \
+    --bridge /path/to/tuxbox_xshader-test-binary \
+    --dxc /path/to/dxc --dxv /path/to/dxv \
+    --work /tmp/scalar-check --output /tmp/scalar-receipt.json --jobs 2
+```
+
+The bridge runs the production native decoder and full translator. It batches
+complete emitted HLSL function bodies only when their helper headers match,
+and adds stores for all eight registers and the condition code. All input
+registers and SCC are initialized by each synthetic program. DXC folds the
+constant computations; DXV validates the resulting DXIL. Missing, duplicate,
+nonconstant or mismatched stores fail the gate, as do translation refusals or
+tool failures. The Python checker recomputes expected values independently
+from the native words, not from the translator's HLSL or a trusted manifest.
+The test does not execute generated DXIL on hardware.
+
+Inspect any case step-by-step without invoking a compiler:
+
+```sh
+python tools/reference/rdna2_scalar.py /tmp/scalar-corpus/programs.txt --case 000000
+```
+
+Results on the measured CPU-only campaign:
+- LLVM confirms all 77 instruction encodings.
+- Core: 8,577/8,577 programs, 77,193 register/flag values, no mismatches;
+  also passes on the separate #58 translator test build.
+- Extended on #58: 10,026/10,113 programs, 90,234 compared values, no
+  numerical mismatches. 87 chained programs are conservatively refused,
+  and the gate correctly fails. These are reproducible remaining limitations,
+  not confirmed failures in the retail game.
+- A deliberately faulty addition-to-subtraction translator in a temporary
+  test worktree produced five mismatches. The mutation is not in this PR.
+
+See [the receipt](../evidence/scarlett-scalar-oracle.json) for case IDs,
+seeds, exact corpus/compiler digests and counts. This is a reusable test tool,
+not a change to the shipping translator or a claim of retail compatibility.
+
+Rechecked the same core corpus after updating to upstream `3086e0b`: all
+8,577 cases passed again. The earlier #58 and mutation receipts retain their
+original source fingerprints.
+
+
+### Bounded differential campaign and small reproducers
+
+Use the existing CPU reference and full-translator bridge; no new runtime
+dependencies. The campaign generates initialized straight-line scalar
+instruction chains, verifies every distinct native instruction encoding
+against LLVM gfx1030, checks the same programs with the #60 oracle and
+DXC/DXV, and groups refusals by exact text with the instruction offset
+removed (the same offset normalization principle as #44). Mismatches are
+grouped by differing output indices, not claimed identical root causes.
+A representative of each selected group is rechecked individually, reduced
+by removing complete instructions after the fixed nine-instruction
+initialization, then replayed twice in fresh compiler calls. Local
+one-deletion minimality is recorded; this is not a global minimum. The
+report stores the native words, assembly, expected state, case digest,
+classification and counts, as well as structural opcode/alias/adjacency
+features (not compiler branch coverage). Tool errors are not cached or
+reported as confirmed shader defects.
+
+```sh
+python tools/scarlett_campaign.py --bridge /path/to/test-binary \
+    --dxc /path/to/dxc --dxv /path/to/dxv --llvm-mc /path/to/llvm-mc \
+    --profile extended --count 2048 --reduce 12 \
+    --work /tmp/scalar-campaign --output /tmp/scalar-campaign.json
+```
+
+The default core profile is for main without #58. Extended requires the
+proposed #58 operations for a passing run. Use a wrapper executable for
+LLVM if it needs a container. Reuse a confirmed minimized corpus with
+`--replay-report evidence/scarlett-differential-campaign.json --require-pass`
+instead of generating new cases (use fresh work and output paths).
+Replay deliberately bypasses cache. The normal discovery mode reports
+refusals without failing the command; `--require-pass` also fails for them.
+The campaign does not establish actual title coverage.
+
+Optional trusted local `--cache /path/to/cache.json` and repeated
+`--dependency /path/to/compiler-library.so` arguments retain exact
+content-keyed results for repeat work. Include all actual loaded compiler
+libraries (e.g. identify via ldd on trusted local binaries); a different
+tool, source, dependency, Python version or environment refuses reuse.
+Use one owner per cache, not concurrently shared or externally supplied
+cache files. Cache is an optimization, not an independent proof; use a
+fresh cache or no cache for release/regression verification. The tool
+limits compiler workers to two, generated cases to 8,192, total evaluated
+cases/cache entries to 20,000, reductions per representative to 64 and
+representatives to 32. Work is temporary; per-tool timeouts apply and no
+new evaluation starts beyond the 240-second campaign budget.
+
+[Receipt](../evidence/scarlett-differential-campaign.json): 2,048 core
+programs pass; 2,048 extended programs on the original #58 expose 483
+refusals across twelve known provenance-related instruction signatures,
+all confirmed as small reproducible cases. With the conservative compute
+provenance follow-up all 2,048 pass, and the older 8,577 core plus 10,113
+extended cases pass. The fix remains a separate change to #58. No accepted
+case shows a numerical disagreement. Five alternating fresh/reused
+evaluations of 512 identical programs (seed 17294091; LLVM checks in
+both arms; cache primed once) measured 4.63 s vs 0.47 s median on the
+local machine. This is repeat validation with an unchanged toolchain,
+not faster cold discovery or a claim of higher FPS. The campaign remains
+deliberately narrow: no memory, wave execution, branches or GPU testing.
 ### Ordinary scalar bit operations
 
 The generic translator supports nine additional scalar bit instructions and applies the ordinary-scalar proof to the three forms already added by #56
