@@ -227,3 +227,41 @@ The issue #39 log contains 262 failed driver allocation attempts and
 131 host import failure messages, not a confirmed VRAM exhaustion or
 a proven fault in these provider call sites. The opt-in trace is intended
 to distinguish those possibilities in a subsequent authorized run.
+
+### Ordinary scalar bit operations
+
+The generic translator supports twelve additional scalar bit instructions
+(32/64-bit zero counts, zero searches, leading-bit searches, reversal,
+bit setting/clearing and testing). The local reaching-definition check
+requires ordinary scalar values, not an assumed full-wave EXEC/VCC mask.
+Unknown halves, branch entries and indirect control flow remain unsupported;
+private packed and mesh paths are outside this proof. The rules follow
+[AMD's RDNA 2 ISA reference](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf), SOP1/SOPC.
+
+CPU-only controls:
+
+- Capture `cargo test --manifest-path tools/shader-compiler/Cargo.toml --target x86_64-unknown-linux-gnu scalar_bit_cpu_oracle_fixture -- --nocapture`
+  to a fresh fixture file. Run `python tools/check_scalar_bits.py --help`
+  for the DXC/DXV numerical oracle: 1,944 cases, 7,776 checked values.
+- Run `python tools/check_scalar_native.py --help` with the baseline and
+  candidate xshader executables: 13 synthetic native programs recovered,
+  six deliberately unsupported controls retained, one unchanged control.
+
+[CPU evidence](../evidence/scarlett-ordinary-scalar-bits.json). These controls
+are not retail shader coverage or proof of GPU execution.
+
+
+The dependent-compute follow-up preserves ordinary scalar provenance through
+verified min/max, wide shifts, bit updates and conditional/carry operations
+only when the ordinary inputs (and, when required, SCC) are proven. It
+does not relax branch, special wave-mask, mesh or unknown-input checks.
+The CPU campaign found 483 rejected programs among 2,048 synthetic extended
+programs on the previous #58 implementation, across twelve known
+provenance-related refusal signatures. The twelve minimized native
+reproducers are now permanent compiler tests. The full 2,048-program
+campaign and the older 8,577 core plus 10,113 extended CPU-oracle programs
+pass on the integrated current main + follow-up build (186,642 observed
+register/flag values in total). Negative controls reject unknown SCC,
+EXEC-derived SCC and unproven high halves. See
+[evidence](../evidence/scarlett-dependent-scalar-chains.json). No GPU or
+retail compatibility claim.
