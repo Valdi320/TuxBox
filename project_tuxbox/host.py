@@ -41,6 +41,38 @@ def proton_installation(selection):
     raise ValueError("Select an installed Proton distribution with --proton or PROTONPATH")
 
 
+def warn_scarlett_dxc(executable, report):
+    """Check app-local Windows DXC files, without installing or changing them.
+
+    A system-provided compiler can still work, so this is advisory only.
+    The Linux dxc used for shader preparation is a separate dependency.
+    """
+    if executable.name.casefold() != "game_scarlett_master.exe":
+        return
+    import pefile
+
+    problems = []
+    for name in ("dxcompiler.dll", "dxil.dll"):
+        path = executable.with_name(name)
+        if not path.is_file():
+            problems.append(f"{name} missing")
+            continue
+        try:
+            pe = pefile.PE(str(path), fast_load=True)
+            try:
+                if (pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20b
+                        or not pe.FILE_HEADER.Characteristics & 0x2000):
+                    problems.append(f"{name} is not an x64 Windows DLL")
+            finally:
+                pe.close()
+        except (OSError, pefile.PEFormatError):
+            problems.append(f"{name} is unreadable or not a valid PE")
+    if problems:
+        report("ProjectScarlett Windows DXC: " + "; ".join(problems)
+               + ". For rectangle pipelines, stage both DLLs from the same Microsoft x64 DXC release"
+               " beside the executable (see docs/PROJECTSCARLETT.md). A system installation may also work.")
+
+
 PACKAGE_DRIVE_RECORD = "tuxbox-package-drive.json"
 
 
@@ -239,6 +271,8 @@ class Host:
     def run_game(self, executable, arguments, log, *, package=None, mangohud=False, profile_pipelines=False):
         env = self.env.copy()
         env.setdefault("TUXBOX_LOG", "stderr" if self.backend == "native" else "1")
+        if "-nullrhi" not in (arg.lower() for arg in arguments):
+            warn_scarlett_dxc(executable, log.status)
         env.pop("TUXBOX_WINE_TITLE_TEMP", None)
         env.pop("TUXBOX_WINE_PACKAGE_DRIVE", None)
         drive_prefix = None
