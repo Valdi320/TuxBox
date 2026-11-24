@@ -265,7 +265,7 @@ class RuntimeShaderLinks(unittest.TestCase):
         pending.mkdir()
         stop = Event()
         with patch("project_tuxbox.runtime_shaders.compiler_tools", side_effect=ValueError("compiler unavailable")):
-            serve(self.session, stop, lambda line: stop.set())
+            serve(self.session, stop, lambda line: stop.set() if 'compiler unavailable' in line else None)
         self.assertTrue((self.session / (key + ".failed")).is_file())
         self.assertFalse(completed.exists())
         self.assertTrue(pending.is_dir())

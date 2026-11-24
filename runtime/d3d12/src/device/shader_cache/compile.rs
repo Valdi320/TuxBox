@@ -4,7 +4,10 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, OnceLock};
+
+mod request_locks;
+use request_locks::RequestLocks;
 use std::time::{Duration, Instant};
 
 fn session() -> Option<&'static PathBuf> {
@@ -85,7 +88,7 @@ fn cached_refusal(cache: &Path, key: &str) -> bool {
 }
 
 pub(super) fn on_demand(shader: &[u8], source: &str, stage: Stage) -> Option<Vec<u8>> {
-    request(source, stage, |pending, requests| {
+    request(source, stage, "dxbc", |pending, requests| {
         fs::write(pending, shader)?;
         fs::rename(pending, requests.join(format!("{source}.dxbc")))
     })
@@ -93,7 +96,7 @@ pub(super) fn on_demand(shader: &[u8], source: &str, stage: Stage) -> Option<Vec
 
 pub(crate) fn stencil(shader: &[u8], source: &str, slot: u32) -> Option<Vec<u8>> {
     let key = format!("{source}_rt{slot}");
-    request(&key, Stage::Pixel, |pending, requests| {
+    request(&key, Stage::Pixel, "stencil", |pending, requests| {
         fs::write(pending, shader)?;
         fs::rename(pending, requests.join(format!("{key}.stencil")))
     })
@@ -107,7 +110,7 @@ pub(super) fn linked(
 ) -> Option<Vec<u8>> {
     let order = super::source_digest(pixel_dxil)?;
     let key = format!("{}_{}_{order}", producer.0, pixel.0);
-    request(&key, stage, |pending, requests| {
+    request(&key, stage, "link", |pending, requests| {
         fs::create_dir(pending)?;
         let publish = || {
             fs::write(pending.join("producer.dxbc"), producer.1)?;
@@ -126,6 +129,7 @@ pub(super) fn linked(
 fn request(
     key: &str,
     stage: Stage,
+    extension: &str,
     submit: impl FnOnce(&Path, &Path) -> io::Result<()>,
 ) -> Option<Vec<u8>> {
     let dir = session()?;
@@ -133,13 +137,11 @@ fn request(
     if let Some(bytes) = read_portable_file(&result, stage) {
         return Some(bytes);
     }
-    // Pipeline workers can request the same program concurrently. Serialize
-    // publication for the same digest while allowing unrelated jobs to overlap.
-    static LOCKS: [Mutex<()>; 32] = [const { Mutex::new(()) }; 32];
-    let bucket = usize::from_str_radix(&key[..2], 16).ok()? % LOCKS.len();
-    let _guard = LOCKS[bucket]
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    // Serialize the exact digest, not a hash bucket. Unrelated programs
+    // must not wait behind a slow translation (or its 90-second timeout).
+    static LOCKS: LazyLock<RequestLocks> = LazyLock::new(RequestLocks::default);
+    let lock = LOCKS.for_key(key);
+    let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
     if let Some(bytes) = read_portable_file(&result, stage) {
         return Some(bytes);
     }
@@ -160,12 +162,24 @@ fn request(
             return None;
         }
     }
-    // An earlier temporary tool failure completed its request. A new pipeline may retry it.
-    let _ = fs::remove_file(&failed);
-    if let Err(err) = submit(&pending, &dir.join("requests"))
-        && err.kind() != io::ErrorKind::AlreadyExists
-    {
-        return None;
+    let requests = dir.join("requests");
+    let published = requests.join(format!("{key}.{extension}"));
+    // A timed-out caller does not own the source anymore. Rejoin the
+    // outstanding request rather than replace it while the host is reading
+    // or about to remove it. The host publishes failure before removing the
+    // source; only a new publication may clear that old failure.
+    if !published.exists() {
+        // A successful worker may have completed between the first read
+        // and the existence check. Avoid compiling that request twice.
+        if let Some(bytes) = read_portable_file(&result, stage) {
+            return Some(bytes);
+        }
+        let _ = fs::remove_file(&failed);
+        if let Err(err) = submit(&pending, &requests)
+            && err.kind() != io::ErrorKind::AlreadyExists
+        {
+            return None;
+        }
     }
     let start = Instant::now();
     loop {

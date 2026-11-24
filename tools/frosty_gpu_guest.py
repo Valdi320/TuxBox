@@ -8,12 +8,12 @@ from project_tuxbox.runtime_shaders import shader_session
 from project_tuxbox.shader_prep import SOURCE_CACHE
 
 
-def run_gpu_guest(source, name, trial, work, proton, prefix_source, provider, compiler_dir, *, vkd3d_dir=None):
+def run_gpu_guest(source, name, trial, work, proton, prefix_source, provider, compiler_dir, *, vkd3d_dir=None, link_libraries=(), extra_env=None):
     files = proton / "files"
     tools = Toolchain()
     obj = tools.compile(source, trial, "/W4", "/WX", f"/I{ROOT / 'runtime/d3d12'}")
     exe = trial / name
-    tools.link(exe, obj, "d3d12.lib", "dxgi.lib", "kernel32.lib")
+    tools.link(exe, obj, "d3d12.lib", "dxgi.lib", "kernel32.lib", *link_libraries)
     prefix = trial / "prefix"
     subprocess.run(["cp", "-a", "--reflink=auto", prefix_source.resolve(), prefix], check=True)
     shutil.copyfile(provider, trial / "d3d12_xs.dll")
@@ -33,6 +33,9 @@ def run_gpu_guest(source, name, trial, work, proton, prefix_source, provider, co
     environment = dict(WINEPREFIX=prefix, WINESERVER=files / "bin/wineserver", WINEDEBUG="-all", VKD3D_DEBUG="warn",
                        WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=n,b", XDG_CACHE_HOME=trial / "cache",
                        XDG_RUNTIME_DIR=trial / "runtime", TMPDIR=trial / "tmp", VKD3D_SHADER_CACHE_PATH=trial)
+    if any(not key.startswith("TUXBOX_") for key in (extra_env or {})):
+        raise ValueError("extra guest environment must contain only TUXBOX_ controls")
+    environment.update(extra_env or {})
     # The provider requests translation through the launcher's per-prefix
     # session. Keep the host worker alive while the sandboxed guest runs.
     with (work / "gpu.log").open("w") as log:

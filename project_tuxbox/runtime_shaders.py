@@ -1,5 +1,6 @@
 """Compile Xbox shaders and link raster stages requested by a running Proton game."""
 from contextlib import contextmanager
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as wait_futures
 import errno
 import hashlib
 import os
@@ -10,7 +11,7 @@ import stat
 import struct
 import subprocess
 from tempfile import TemporaryDirectory
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 
 from .inspect import digest
 from .shader_prep import SOURCE_CACHE, ToolFailure, compiler_tools, has_dxil_container, run_tool
@@ -181,11 +182,11 @@ def remove_request(path):
         path.unlink(missing_ok=True)
 
 
-def serve(session, stop, report, archive=None):
+def serve(session, stop, report, archive=None, jobs=1):
     # Cargo can replace the release executable while another title is running.
     # Keep the executable we fingerprint private to this host worker.
     with TemporaryDirectory(prefix="tuxbox-xshader-") as tmp, request_notifications(session / "requests", stop) as wait:
-        _serve_requests(session, stop, report, Path(tmp) / "xshader", wait, archive)
+        _serve_requests(session, stop, report, Path(tmp) / "xshader", wait, archive, jobs)
 
 
 @contextmanager
@@ -234,11 +235,45 @@ def snapshot_compiler_cache(xshader, cache_root):
     return tools, cache
 
 
-def _serve_requests(session, stop, report, xshader, wait, archive):
+def runtime_jobs(env, report):
+    """Bound live compiler subprocesses; honor the launcher's CPU affinity."""
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cpus = os.cpu_count() or 1
+    cap = max(1, min(8, cpus))
+    default = min(4, cap)
+    value = env.get("TUXBOX_RUNTIME_SHADER_JOBS")
+    if value is None:
+        return default
+    try:
+        jobs = int(value)
+        if not 1 <= jobs <= 8:
+            raise ValueError
+    except ValueError:
+        report(f"Invalid TUXBOX_RUNTIME_SHADER_JOBS={value!r}; using {default}")
+        return default
+    return min(jobs, cap)
+
+
+def ordered_requests(directory):
+    """Mix ordinary, linked and stencil requests in publication order."""
+    entries = []
+    for source in directory.iterdir():
+        if source.suffix not in REQUEST_PATTERNS:
+            continue
+        try:
+            timestamp = source.lstat().st_mtime_ns
+        except FileNotFoundError:
+            continue
+        entries.append((timestamp, source.name, source))
+    return [source for _, _, source in sorted(entries)]
+
+
+def _serve_requests(session, stop, report, xshader, wait, archive, jobs=1):
     def bind_cache():
         tools, cache = snapshot_compiler_cache(xshader, session.parent)
         # Publish only after the exact compiler used by this worker is pinned.
-        # A guest which starts earlier can still submit ordinary requests.
         pending = session / "compiler-id.tmp"
         pending.write_text(cache.name, encoding="ascii")
         pending.replace(session / "compiler-id")
@@ -251,53 +286,95 @@ def _serve_requests(session, stop, report, xshader, wait, archive):
         except (OSError, ValueError, subprocess.SubprocessError):
             pass  # Retry and report the error if this game needs a shader.
     refused = cached_refusals = 0
+    record_requests = archive is not None
+    archive_lock = Lock()
+    archive_errors = []
 
     def remember(source, inputs):
         nonlocal archive
-        if archive is not None:
-            try:
-                archive_request(archive, source, inputs)
-            except OSError as exc:
-                report(f"Could not save ProjectScarlett shader requests for the next launch: {exc}")
-                archive = None
+        with archive_lock:
+            if archive is not None:
+                try:
+                    archive_request(archive, source, inputs)
+                except OSError as exc:
+                    archive_errors.append(f"Could not save ProjectScarlett shader requests for the next launch: {exc}")
+                    archive = None
 
-    while not stop.is_set():
-        directory = session / "requests"
-        requests = [*directory.glob("*.dxbc"), *directory.glob("*.link"), *directory.glob("*.stencil")]
-        if not requests:
-            wait()
-            continue
-        for source in requests:
-            if stop.is_set():
-                break
-            key = source.stem
-            if not re.fullmatch(REQUEST_PATTERNS[source.suffix], key):
-                remove_request(source)
-                continue
-            failed = False
-            try:
-                if tools is None:
-                    tools, cache = bind_cache()
-                if archive is None:
-                    compiled = compile_request(source, key, tools, cache, session)
-                else:
-                    compiled = compile_request(source, key, tools, cache, session, remember=remember)
-                if compiled:
-                    report(f"Compiled Xbox shader {key}")
-            except ShaderRefused as exc:
-                failed = True
-                if exc.cached:
-                    cached_refusals += 1
-                else:
-                    refused += 1
-                    report(f"Xbox shader {key}: {exc}")
-            except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                failed = True
+    def compile_one(source, key, bound_tools, bound_cache):
+        # Only this job owns the source. Archive publication is separately
+        # serialized; compiler temporary directories are private per request.
+        if record_requests:
+            return compile_request(source, key, bound_tools, bound_cache, session, remember=remember)
+        return compile_request(source, key, bound_tools, bound_cache, session)
+
+    def complete(source, key, future=None, error=None):
+        nonlocal refused, cached_refusals
+        failed = False
+        try:
+            if error is not None:
+                raise error
+            if future.result():
+                report(f"Compiled Xbox shader {key}")
+        except ShaderRefused as exc:
+            failed = True
+            if exc.cached:
+                cached_refusals += 1
+            else:
+                refused += 1
                 report(f"Xbox shader {key}: {exc}")
-            finally:
-                remove_request(source)
-                if failed:
-                    (session / (key + ".failed")).touch()
+        except Exception as exc:
+            # A worker failure must release its guest waiter. Never turn a
+            # transient tool or programming error into a persistent refusal.
+            failed = True
+            report(f"Xbox shader {key}: {exc}")
+        finally:
+            # Publish the terminal result before releasing the source name.
+            # Once it disappears, the guest may clear the old failure and
+            # publish a new generation of the same request.
+            if failed:
+                (session / (key + ".failed")).touch()
+            remove_request(source)
+
+    directory = session / "requests"
+    active = {}
+    report(f"Xbox shader worker: up to {jobs} concurrent requests")
+    with ThreadPoolExecutor(max_workers=jobs, thread_name_prefix="xshader") as pool:
+        while active or not stop.is_set():
+            for key, (source, future) in list(active.items()):
+                if future.done():
+                    complete(source, key, future)
+                    del active[key]
+            with archive_lock:
+                messages = archive_errors[:]
+                archive_errors.clear()
+            for message in messages:
+                report(message)
+            # No unbounded executor queue: on shutdown only running jobs
+            # finish, before the session's files and pinned compiler disappear.
+            if not stop.is_set() and len(active) < jobs:
+                for source in ordered_requests(directory):
+                    if stop.is_set() or len(active) >= jobs:
+                        break
+                    key = source.stem
+                    if not re.fullmatch(REQUEST_PATTERNS[source.suffix], key):
+                        remove_request(source)
+                        continue
+                    if key in active:
+                        continue
+                    if tools is None:
+                        try:
+                            tools, cache = bind_cache()
+                        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                            complete(source, key, error=exc)
+                            continue
+                    active[key] = (source, pool.submit(compile_one, source, key, tools, cache))
+            if active:
+                # Wake immediately when any worker completes, with a bounded
+                # rescan interval for new requests. Do not spin during stop.
+                wait_futures([future for _, future in active.values()],
+                             timeout=0.05, return_when=FIRST_COMPLETED)
+            elif not stop.is_set():
+                wait()
     if refused or cached_refusals:
         report(f"Xbox shader worker: {refused} new unsupported translations, {cached_refusals} cached refusals")
 
@@ -330,7 +407,8 @@ def shader_session(cache, env, report, *, archive=None):
         (session / "requests").mkdir()
         env["TUXBOX_SHADER_SESSION"] = session.name
         stop = Event()
-        worker = Thread(target=serve, args=(session, stop, report, archive), name="shader-compiler", daemon=True)
+        worker = Thread(target=serve, args=(session, stop, report, archive, runtime_jobs(env, report)),
+                        name="shader-compiler", daemon=True)
         worker.start()
         try:
             yield
