@@ -97,7 +97,10 @@ pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
                     }
                     _ => unreachable!("signed clamp arithmetic"),
                 };
-                return Ok(format!("asuint(clamp({value}, -32768, 32767))"));
+                // Keep the saturated representation unsigned before packing. The
+                // sign-biased ordering is exactly the signed ordering, but
+                // avoids narrow signed intermediates in the host optimizer.
+                return Ok(format!("(clamp((asuint({value}) ^ 0x80000000u), 0x7fff8000u, 0x80007fffu) ^ 0x80000000u)"));
             }
             // 65535*65535+65535 fits in uint32, and unsigned subtract
             // must clamp at zero before any modular underflow.
@@ -196,7 +199,11 @@ mod tests {
             if matches!(name, "v_pk_max_u16" | "v_pk_min_u16") {
                 assert!(expression(&native(first | 0x8000, second)).is_err());
             } else {
-                assert!(expression(&native(first | 0x8000, second)).unwrap().is_some());
+                let clamped = expression(&native(first | 0x8000, second)).unwrap().unwrap();
+                if name.ends_with("_i16") {
+                    assert!(clamped.contains("0x7fff8000u, 0x80007fffu"));
+                    assert!(clamped.contains("^ 0x80000000u"));
+                }
             }
             assert!(expression(&native(first | 0x8000, (second & !511) | 4)).is_err());
             assert!(expression(&native(first, (second & !511) | 4)).is_err());
