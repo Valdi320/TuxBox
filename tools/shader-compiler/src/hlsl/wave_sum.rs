@@ -435,21 +435,37 @@ pub(super) fn portable_single_wave(insns: &[Insn]) -> bool {
         }
         let Some(start) = first.checked_sub(2) else { return false };
         let Some(block) = insns.get(start..start + 12) else { return false };
-        let [Opnd::Sgpr(saved)] = block[0].dst[..] else { return false };
-        if saved >= 105 || saved % 2 != 0 || block[0].mnemonic != "s_or_saveexec_b64"
-            || block[0].src != [Opnd::ConstInt(-1)]
+        // The same group-shared exchange works for the already verified
+        // extrema pattern, but only with the direct saved-EXEC predicate.
+        // A floating identity move belongs to the protected region too.
+        let operation = i.mnemonic.as_str();
+        if !matches!(operation, "v_add_nc_u32" | "v_min_u32" | "v_max_u32" |
+            "v_min_f32" | "v_max_f32") { return false; }
+        let floating = matches!(operation, "v_min_f32" | "v_max_f32");
+        let Some(covered_start) = start.checked_sub(usize::from(floating)) else { return false };
+        let save = &insns[covered_start];
+        let [Opnd::Sgpr(saved)] = save.dst[..] else { return false };
+        if floating {
+            let identity = if operation == "v_min_f32" { 0x7f800000 } else { 0xff800000 };
+            if block[0].mnemonic != "v_mov_b32" || block[0].src != [Opnd::Literal(identity)]
+                || block[0].dst.len() != 1 || block[1].src.first() != block[0].dst.first()
+            { return false; }
+        }
+        if saved >= 105 || saved % 2 != 0 || save.mnemonic != "s_or_saveexec_b64"
+            || save.src != [Opnd::ConstInt(-1)]
             || block[1].mnemonic != "v_cndmask_b32"
+            || block[1].src.get(2) != Some(&Opnd::Sgpr(saved))
             || !block[2..6].iter().enumerate().all(|(step, i)| {
-                i.op == DPP_REDUCE && i.aux.imm == step as i64 && i.mnemonic == "v_add_nc_u32"
+                i.op == DPP_REDUCE && i.aux.imm == step as i64 && i.mnemonic == operation
             })
             || block[6].mnemonic != "v_permlanex16_b32"
             || block[6].raw.first().is_none_or(|w| w & 0x7800 != 0)
-            || block[7].mnemonic != "v_add_nc_u32"
-            || block[9].mnemonic != "v_add_nc_u32"
+            || block[7].mnemonic != operation
+            || block[9].mnemonic != operation
             || block[11].mnemonic != "s_mov_b64"
             || block[11].dst != [Opnd::ExecLo]
             || block[11].src != [Opnd::Sgpr(saved)]
-            || covered[start..start + 12].iter().any(|&v| v)
+            || covered[covered_start..start + 12].iter().any(|&v| v)
         {
             return false;
         }
@@ -464,7 +480,7 @@ pub(super) fn portable_single_wave(insns: &[Insn]) -> bool {
         }
         masks.extend([saved, saved + 1]);
         reads.push(start + 10);
-        covered[start..start + 12].fill(true);
+        covered[covered_start..start + 12].fill(true);
     }
     if reads.is_empty() {
         return false;
@@ -635,6 +651,35 @@ mod tests {
             ex.isa_data = ex.isa.clone();
             let reason = super::super::translate(&ex).err().unwrap();
             assert!(reason.contains("divergent control flow"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn portable_extrema_requires_direct_exec_and_no_mask_escape() {
+        for operation in ["umin", "umax", "fmin", "fmax"] {
+            let ex = fixture::extrema(64, operation);
+            let translated = super::super::translate(&ex).unwrap();
+            assert_eq!(translated.required_wave_size, None);
+            assert!(translated.hlsl.contains("tb_reduction_read("));
+            assert!(!translated.hlsl.contains("WaveReadLaneAt("));
+            let mut ops = crate::rdna2::disassemble(&ex.isa);
+            assert_eq!(super::super::lower_wave_reductions(&mut ops).unwrap(), Some(64));
+            assert!(portable_single_wave(&ops));
+            let select = ops.iter().position(|i| i.mnemonic == "v_cndmask_b32").unwrap();
+            let mut altered = ops.clone();
+            altered[select].src[2] = Opnd::Sgpr(8);
+            assert!(!portable_single_wave(&altered));
+            if operation.starts_with('f') {
+                let mut altered = ops.clone();
+                altered[select-1].src[0] = Opnd::Literal(0);
+                assert!(!portable_single_wave(&altered));
+            }
+            let mut altered = ops.clone();
+            altered.insert(altered.len()-1, insn("s_mov_b32", Enc::Sop1, 0,
+                vec![Opnd::Sgpr(8)], vec![Opnd::Sgpr(0)]));
+            assert!(!portable_single_wave(&altered));
+            let native = fixture::extrema(32, operation);
+            assert_eq!(super::super::translate(&native).unwrap().required_wave_size, Some(32));
         }
     }
 

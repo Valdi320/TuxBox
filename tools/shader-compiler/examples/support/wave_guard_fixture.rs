@@ -54,3 +54,30 @@ pub fn shader(width: u32) -> (ShaderExtract, Vec<u32>, usize) {
     };
     (ex, words, cmp)
 }
+
+#[allow(dead_code)]
+pub fn extrema(width: u32, operation: &str) -> ShaderExtract {
+    let (mut shader, mut words, end) = shader(width);
+    words.truncate(end);
+    // gfx1030 LLVM-assembled opcodes. Replace only the reduction op;
+    // the existing DPP8/DPP16 controls and lane reads are unchanged.
+    let (opcode, identity) = match operation {
+        "umin" => (0x26000000, None),
+        "umax" => (0x28000000, None),
+        "fmin" => (0x1e000000, Some(0x7f800000)),
+        "fmax" => (0x20000000, Some(0xff800000)),
+        _ => panic!("invalid operation"),
+    };
+    for word in &mut words {
+        if *word >> 24 == 0x4a { *word = opcode | (*word & 0x00ffffff); }
+    }
+    if operation == "umin" { words[2] = 0x000200c1; }
+    if let Some(bits) = identity {
+        words[2] = 0x00020104;
+        words.splice(1..1, [0x7e0802ff, bits]);
+    }
+    words.push(0xbf810000);
+    shader.isa = words.iter().flat_map(|word|word.to_le_bytes()).collect();
+    shader.isa_data = shader.isa.clone();
+    shader
+}
