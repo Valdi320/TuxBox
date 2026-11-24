@@ -609,3 +609,45 @@ python tools/reference/scarlett_resource_fixture.py /tmp/resource-control
 the sampled memory and the improved/negative frame-time controls. In the
 negative control two pairs improve but the third contains 100 ms stalls;
 the all-pairs gate correctly fails despite the improved median.
+
+
+### Integrated RTX 4080 synthetic verification (local test branch)
+
+This integration branch combines the nine pending contributions with
+main 3086e0b for testing, not as a request to merge them in bulk.
+See [the measured receipt](../evidence/scarlett-unified-rtx4080.json).
+All 322 unit tests passed. GPU controls use a disposable offline Proton
+prefix, no retail inputs: 192 dynamic scalar evaluations of the twelve
+minimized dependent-chain reproducers (1,728 register/flag values and
+2,880 guard words); 3,072 raw-index words; 39,168 wave32/wave64 words;
+741 atomic texels; and 24 real pipeline creations at each of four and
+eight compiler workers with 16 distinct requests compiled once per run.
+All readbacks matched. The first eight-worker run had a corrupted log
+line due to mixed guest/host output; separating those streams fixed
+the diagnostic capture and both worker configurations passed a fresh
+run. No runtime algorithm was changed for that log fix.
+
+To reproduce the dynamic scalar check, build the D3D12 provider, the
+host xshader executable and the test bridge as described above. Set
+`DXC`, `TUXBOX_XSHADER`, and the build toolchain environment as appropriate.
+Run (with local absolute tool and template-prefix paths):
+
+```sh
+python tools/check_scarlett_scalar_gpu.py \
+  --bridge /path/to/xshader-test-binary --dxc /path/to/dxc --dxv /path/to/dxv \
+  --provider build/d3d12-smoke/d3d12_xs.dll \
+  --proton /path/to/Proton --prefix /path/to/clean/prefix \
+  --compiler-dir /path/to/windows-dxc/bin/x64 \
+  --reproducers evidence/scarlett-differential-campaign.json \
+  --adapter 10de:2704 --work /tmp/scalar-gpu-work --output /tmp/scalar-gpu.json
+```
+
+The test bridge translates the original native instruction chains.
+The harness instruments initialization and observable stores only,
+then uses sixteen independently seeded runtime inputs per chain,
+including boundary values and both initial SCC states. It checks the
+entire guarded buffer against the independent CPU model, not just the
+changed values. Existing `check_raw_index.py`, `check_wide_atomic.py`,
+`check_wave_guard.py` and `check_live_shader_worker.py` provide the other
+controls. These results demonstrate the selected synthetic cases on this
+GPU; no ProjectScarlett gameplay, performance or full title coverage claim.

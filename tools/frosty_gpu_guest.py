@@ -38,15 +38,20 @@ def run_gpu_guest(source, name, trial, work, proton, prefix_source, provider, co
     environment.update(extra_env or {})
     # The provider requests translation through the launcher's per-prefix
     # session. Keep the host worker alive while the sandboxed guest runs.
-    with (work / "gpu.log").open("w") as log:
+    # Keep subprocess output separate from host worker reports. A guest may
+    # emit a partial line in several writes; mixing the streams can corrupt a
+    # complete host record even when the compilation and reply succeeded.
+    with (work / "gpu.log").open("w") as log, (work / "host-worker.log").open("w") as host_log:
         def report(message):
-            log.write(message + "\n")
-            log.flush()
+            host_log.write(message + "\n")
+            host_log.flush()
         with shader_session(prefix / SOURCE_CACHE.parent, environment, report):
             for key, value in environment.items():
                 command.extend(["--setenv", key, str(value)])
             command.extend(["--", "xvfb-run", "-a", "timeout", "-k", "2s", "45s", str(files / "bin/wine"), str(exe)])
             result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=55)
+        log.write("\n--- Host shader worker (separate stream) ---\n")
+        log.write((work / "host-worker.log").read_text())
     raw = trial / "result.txt"
     observed = dict(line.split("=", 1) for line in raw.read_text().splitlines()) if raw.exists() else {}
     return exe, result.returncode, observed
