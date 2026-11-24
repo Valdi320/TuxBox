@@ -64,6 +64,7 @@ mod ray_resolve;
 mod fspx_wave;
 mod singleton_wave;
 mod wave_sum;
+mod raw_index;
 mod reflection_compact;
 pub(crate) mod radiance_probe;
 mod screen_gather;
@@ -396,6 +397,8 @@ struct Emitter<'a> {
     /// PersistentClusterCull's validated buffer layout and cross-group UAV queue.
     persistent_queue: bool,
     raw: BTreeSet<(bool, u32)>,
+    // Native sites with a proven byte-stride-one linear descriptor.
+    raw_byte_index: BTreeSet<usize>,
     tbuf: BTreeSet<(bool, u32)>,      // typed buffers (is_uav, slot)
     tbuf_uint: BTreeSet<u32>,         // typed UAV slots whose element must be uint (atomics)
     /// Inferred integer element type of typed buffers: (is_uav, slot) -> 1 uint, 2 sint.
@@ -1708,6 +1711,7 @@ impl<'a> Emitter<'a> {
             reflected_strides: BTreeSet::new(),
             persistent_queue: false,
             raw: BTreeSet::new(),
+            raw_byte_index: BTreeSet::new(),
             tbuf: BTreeSet::new(),
             tbuf_uint: BTreeSet::new(),
             tbuf_ty: BTreeMap::new(),
@@ -2193,6 +2197,7 @@ impl<'a> Emitter<'a> {
         self.bsel.clear();
         self.dsel_loads.clear();
         self.dsel_moves.clear();
+        self.raw_byte_index.clear();
         // Recording pass with the converged entry states.
         for (b, r) in ranges.iter().enumerate() {
             if let Some((mut sym, mut written)) = states[b].clone() {
@@ -3169,11 +3174,17 @@ impl<'a> Emitter<'a> {
                 Enc::Mubuf if ins.op == 0x71 || ins.op == 0x72 => {}
                 Enc::Mubuf => {
                     let rs = ins.src.get(1).and_then(sg).ok_or("mubuf: bad srsrc")?;
+                    // Never retain a provisional proof from another CFG visit.
+                    self.raw_byte_index.remove(&ins.offset);
                     if let Some(raw) = self.mesh_raw_descriptor(sym, rs)? {
+                        self.raw_byte_index.insert(ins.offset);
                         self.res.insert(idx, vec![raw]);
                         continue;
                     }
                     if let Some(Sym::DirectRaw(slot)) = sym.get(&rs) {
+                        if raw_index::local_byte_descriptor(&insns[block_start..idx], rs) {
+                            self.raw_byte_index.insert(ins.offset);
+                        }
                         self.res.insert(idx, vec![Res::Raw(*slot, false)]);
                         continue;
                     }
@@ -6179,10 +6190,21 @@ uint tb_fmac_half(uint a, uint b, uint c) {
     /// OFFEN and SOFFSET are byte offsets. IDXEN uses the runtime descriptor stride,
     /// which the PSV raw declaration does not encode.
     fn raw_address(&mut self, ins: &Insn) -> Result<String, String> {
-        if ins.aux.mask & 2 != 0 {
-            return Err("raw buffer IDXEN needs the console descriptor stride".into());
-        }
-        let vector = if ins.aux.mask & 1 != 0 { r(&ins.src[0])? } else { "0u".to_string() };
+        let (indexed, offset) = (ins.aux.mask & 2 != 0, ins.aux.mask & 1 != 0);
+        let vector = if indexed {
+            if !self.raw_byte_index.contains(&ins.offset)
+                || !ins.mnemonic.starts_with("buffer_load_dword")
+            {
+                return Err("raw buffer IDXEN needs the console descriptor stride".into());
+            }
+            let index = r(&ins.src[0])?;
+            if offset {
+                let Opnd::Vgpr(v) = ins.src[0] else { return Err("invalid indexed raw address".into()) };
+                let byte_offset = Opnd::Vgpr(v.checked_add(1).ok_or("raw address register overflow")?);
+                self.touch(&byte_offset);
+                format!("({index} + {})", r(&byte_offset)?)
+            } else { index }
+        } else if offset { r(&ins.src[0])? } else { "0u".to_string() };
         let address = format!("raw_addr{}", self.tmp);
         self.tmp += 1;
         self.line(&format!("uint {address} = {vector} + {} + {}u;", r(&ins.src[2])?, ins.aux.imm));
@@ -6333,7 +6355,11 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             let offset = format!("{address} + {}u", 4 * k);
             let reg = Opnd::Vgpr(base.checked_add(k).ok_or("raw buffer register overflow")?);
             if load {
-                self.line(&format!("uint t{t}_{k} = {buffer}.Load({offset});"));
+                if ins.aux.mask & 2 != 0 {
+                    self.line(&format!("uint t{t}_{k} = 0u; if (exec_lo & 1u) t{t}_{k} = {buffer}.Load({offset});"));
+                } else {
+                    self.line(&format!("uint t{t}_{k} = {buffer}.Load({offset});"));
+                }
             } else {
                 self.touch(&reg);
                 self.line(&format!("if (exec_lo & 1u) {buffer}.Store({offset}, {});", r(&reg)?));
