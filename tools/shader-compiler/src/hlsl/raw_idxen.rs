@@ -42,6 +42,12 @@ fn address(words: [u32; 2]) -> String {
     let ex = compute_extract(&words);
     let insns = disassemble(&ex.isa);
     let mut em = Emitter::new(&ex, insns.clone());
+    if insns[0].aux.mask & 2 != 0 {
+        assert!(em.raw_address(&insns[0]).is_err());
+        // These address-only fixtures do not construct a resource descriptor.
+        // Model a separately proven byte stride before exercising arithmetic.
+        em.raw_byte_index.insert(insns[0].offset);
+    }
     em.raw_address(&insns[0]).unwrap();
     em.body
 }
@@ -61,7 +67,7 @@ fn indexed_and_offset_raw_load_uses_consecutive_vgprs() {
     // IDXEN|OFFEN. v2 is the index and v3 is the byte offset.
     let body = address([0xe030_3008, 0x8002_0402]);
     assert!(
-        body.contains("uint raw_addr0 = (v2) + (v3) + 0x0u + 8u;"),
+        body.contains("uint raw_addr0 = (v2 + v3) + 0x0u + 8u;"),
         "{body}"
     );
 }

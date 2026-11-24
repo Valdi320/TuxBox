@@ -165,7 +165,19 @@ def main(argv=None):
                 candidate_repeats+=hashes[1]==previous[1]
             previous=hashes
             rows.append({"frame":name,**row})
+        first_bad = next((i for i, row in enumerate(rows) if not row["passed"]), None)
+        first_black = next((i for i, row in enumerate(rows)
+                            if row["candidate"]["near_black_fraction"] >= 0.99
+                            and row["reference"]["near_black_fraction"] < 0.99), None)
+        def location(i):
+            if i is None:
+                return None
+            return {"index": i, "frame": rows[i]["frame"],
+                    "previous_frame": rows[i-1]["frame"] if i else None,
+                    "bounding_box": rows[i]["bounding_box"]}
         report={"schema":1,"scope":"Aligned SDR PNG pixel comparison; repeated/black frames are observations, not proof of freeze or a rendering bug.",
+                "first_failed_frame": location(first_bad),
+                "first_candidate_only_near_black_frame": location(first_black),
                 "thresholds":{"channel_tolerance":args.tolerance,"max_fraction":args.max_fraction,
                               "max_tile_fraction":args.max_tile_fraction,"tile":args.tile},
                 "frames":rows,"reference_adjacent_identical":reference_repeats,
