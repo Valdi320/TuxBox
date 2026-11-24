@@ -26,7 +26,7 @@ fn definition(ops: &[Insn], targets: &std::collections::BTreeSet<i64>, at: usize
 
 // Upper bit mask: every possible result is a subset of this mask. An
 // ordinary scalar source may be entirely unknown; AND still bounds it.
-fn possible_bits(ops: &[Insn], targets: &std::collections::BTreeSet<i64>, at: usize, reg: u8, depth: u8) -> Option<u32> {
+pub(super) fn possible_bits(ops: &[Insn], targets: &std::collections::BTreeSet<i64>, at: usize, reg: u8, depth: u8) -> Option<u32> {
     if depth == 0 { return None; }
     let Some(j) = definition(ops, targets, at, reg) else { return Some(u32::MAX); };
     let ins = &ops[j];

@@ -506,6 +506,7 @@ struct Emitter<'a> {
     /// Descriptor loads `(base register, descriptor id)` and base-dword moves `(dst, src)`
     /// per instruction, for maintaining the run-time `tb_dsel<reg>` selectors.
     dsel_loads: HashMap<usize, (u16, u32)>,
+    dsel_runtime: HashMap<usize, (u16, u8, u8, u32)>,
     dsel_moves: HashMap<usize, (u16, u16)>,
     /// Registers read before written (entry ABI), from `live_in`.
     live: Vec<String>,
@@ -1843,6 +1844,7 @@ impl<'a> Emitter<'a> {
             msel: HashMap::new(),
             bsel: HashMap::new(),
             dsel_loads: HashMap::new(),
+            dsel_runtime: HashMap::new(),
             dsel_moves: HashMap::new(),
             live: Vec::new(),
             uses_quad: false,
@@ -2270,6 +2272,7 @@ impl<'a> Emitter<'a> {
         self.msel.clear();
         self.bsel.clear();
         self.dsel_loads.clear();
+        self.dsel_runtime.clear();
         self.dsel_moves.clear();
         self.raw_byte_index.clear();
         // Recording pass with the converged entry states.
@@ -3147,8 +3150,26 @@ impl<'a> Emitter<'a> {
                         // Preserve heap-specific lowering above. Only fold an ordinary
                         // descriptor-table offset when every reaching path proves its value.
                     }
-                    let off = self.static_smem_offset(ins)
-                        .ok_or_else(|| format!("s_load at {:#x}: dynamic soffset unsupported", ins.offset))?;
+                    let off = if let Some(off) = self.static_smem_offset(ins) {
+                        off
+                    } else if let Some((reg, imm, candidates)) = self.bounded_cbv_offsets(idx, table, b, d) {
+                        let set = match self.multi_sets.iter().position(|v| *v == candidates) {
+                            Some(set) => set,
+                            None => {
+                                self.multi_sets.push(candidates);
+                                self.multi_sets.len() - 1
+                            }
+                        };
+                        let set = u16::try_from(set).map_err(|_| "too many descriptor sets")?;
+                        for k in 0..n {
+                            sym.insert(d + k as u16, Sym::Multi { set, k });
+                            written.insert(d + k as u16);
+                        }
+                        self.dsel_runtime.insert(idx, (d, table, reg, imm));
+                        continue;
+                    } else {
+                        return Err(format!("s_load at {:#x}: dynamic soffset unsupported", ins.offset));
+                    };
                     if self.mesh_bindings.as_ref().is_some_and(|mesh| {
                         n != 4 || !mesh.tables.contains_key(&(table, off))
                     }) {
@@ -4327,6 +4348,13 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             return Ok(());
         }
         if !self.msel.is_empty() || !self.bsel.is_empty() {
+            if let Some(&(d, table, reg, imm)) = self.dsel_runtime.get(&idx) {
+                let offset = Opnd::Sgpr(reg);
+                self.touch(&offset);
+                self.regs.insert(format!("tb_dsel{d}"));
+                self.line(&format!("tb_dsel{d} = {:#x}u | ({} + {imm:#x}u);",
+                    u32::from(table) << 24, r(&offset)?));
+            }
             if let Some(&(d, id)) = self.dsel_loads.get(&idx) {
                 self.regs.insert(format!("tb_dsel{d}"));
                 self.line(&format!("tb_dsel{d} = {id:#x}u;"));
@@ -6604,6 +6632,83 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             }
         }
         Ok(())
+    }
+
+    /// A conservative first subset: straight-line compute, explicit finite
+    /// CBV root table, unchanged base pair, bounded aligned selector, and
+    /// only immediate scalar-buffer consumers of the descriptor words.
+    fn bounded_cbv_offsets(&self, idx: usize, table: u8, base: u16, dst: u16)
+        -> Option<(u8, u32, Vec<(u8,u32)>)>
+    {
+        use crate::rdna2::clobbers_scalar;
+        let ins = self.insns.get(idx)?;
+        if self.ex.stage != Stage::Compute || self.packed.is_some() || self.mesh_bindings.is_some()
+            || self.compute_heap || table != 4 || base != 4 || ins.op != 2
+            || dst < 16 || dst > 102 || dst % 4 != 0
+            || self.insns.len() > 32768 || self.insns.iter().any(|op|
+                !op.is_complete() || op.enc == Enc::Unknown || op.mnemonic.contains('<')
+                || op.mnemonic.starts_with("tb_") || op.mnemonic.starts_with("s_movrel")
+                || op.mnemonic.starts_with("s_subvector_loop")
+                || op.mnemonic.starts_with("s_cbranch") || matches!(op.mnemonic.as_str(),
+                    "s_branch" | "s_setpc_b64" | "s_swappc_b64" | "s_call_b64" |
+                    "s_rfe_b64" | "s_trap"))
+        { return None; }
+        if self.insns[..idx].iter().any(|op| clobbers_scalar(op, 4) || clobbers_scalar(op, 5)) {
+            return None;
+        }
+        let reg = (ins.raw.get(1)? >> 25) as u8;
+        if reg > 105 || (dst..dst+4).contains(&u16::from(reg)) { return None; }
+        let imm = u32::try_from(ins.aux.imm).ok()?;
+        if imm % 32 != 0 { return None; }
+        let mask = code_offset::possible_bits(&self.insns, &branch_targets(&self.insns), idx, reg, 8)?;
+        if mask == 0 || mask & 31 != 0 || mask.count_ones() > 4 || imm.checked_add(mask)? > 0x00ff_ffff {
+            return None;
+        }
+        let [range] = self.root_table(table)? else { return None };
+        if range.range_type != 2 || range.num == 0 || range.num == u32::MAX
+            || range.offset_in_table != 0 && range.offset_in_table != u32::MAX {
+            return None;
+        }
+        let mut candidates = Vec::new();
+        let mut bits = mask;
+        loop {
+            let off = imm.checked_add(bits)?;
+            let index = off / 32;
+            if index >= range.num { return None; }
+            let slot = range.base_register.checked_add(index)?;
+            if self.ex.resources.iter().filter(|p| p.res_type == 2 && p.space == range.space &&
+                p.lower <= slot && slot <= p.upper).count() != 1 { return None; }
+            if self.table_binding_space(table, off, 32).ok()? != (Some(2), slot, range.space) {
+                return None;
+            }
+            candidates.push((table, off));
+            if bits == 0 { break; }
+            bits = (bits - 1) & mask;
+        }
+        candidates.sort_unstable();
+        // The selector stands in for the descriptor; it is not the descriptor
+        // data. Until general escape analysis exists, reject any clobber,
+        // potential wide source alias or other descriptor use.
+        let mut loads = 0usize;
+        for op in &self.insns[idx+1..] {
+            if (dst..dst+4).any(|reg| clobbers_scalar(op, reg as u8)) { return None; }
+            let consumer = op.enc == Enc::Smem && (8..=12).contains(&op.op) &&
+                op.src.first() == Some(&Opnd::Sgpr(dst as u8)) &&
+                op.raw.get(1).is_some_and(|word| word >> 25 == 0x7d);
+            if consumer { loads += 1; }
+            if op.enc == Enc::Smem && !consumer && op.raw.get(1).is_some_and(|word|
+                (u32::from(dst)..u32::from(dst+4)).contains(&(word >> 25))) {
+                return None;
+            }
+            for (i, src) in op.src.iter().enumerate() {
+                if consumer && i == 0 { continue; }
+                if matches!(src, Opnd::Sgpr(reg) if (dst.saturating_sub(15)..dst+4).contains(&u16::from(*reg))) {
+                    return None;
+                }
+            }
+        }
+        if loads == 0 { return None; }
+        Some((reg, imm, candidates))
     }
 
     fn dynamic_code_offset(&self, idx: usize) -> Option<u8> {

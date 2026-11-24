@@ -217,3 +217,51 @@ fn bounded_runtime_code_offset_uses_real_table_index_without_modulo() {
     bad.push(branch);
     assert_eq!(super::code_offset::prove(&bad,3,24,40),None);
 }
+
+fn bounded_cbv_fixture() -> ShaderExtract {
+    // gfx1030: and s10,s8,1; lshl s10,s10,5; load descriptor s[16:19]
+    // from s[4:5]+s10; buffer_load s20; endpgm.
+    let mut ex = compute_extract(&[
+        0x870a8108, 0x8f0a850a, 0xf4080402, 0x14000000,
+        0xf4200508, 0xfa000000, 0xbf810000]);
+    ex.isa_preamble = [0,1,1,1];
+    ex.resources.push(crate::psv::PsvResource {res_type:2,space:0,lower:0,upper:1});
+    ex.root_sig = Some(crate::meta::RootSig {
+        version:1, flags:0, num_static_samplers:0, static_samplers:Vec::new(),
+        params:vec![crate::meta::RootParam {visibility:0, kind:crate::meta::RootParamKind::Table(vec![
+            crate::meta::RootRange {range_type:2,num:2,base_register:0,space:0,offset_in_table:0}
+        ])}]
+    });
+    ex
+}
+
+#[test]
+fn bounded_dynamic_cbv_descriptors_select_only_reflected_slots() {
+    let ex = bounded_cbv_fixture();
+    let mut em = Emitter::new(&ex, disassemble(&ex.isa));
+    em.resolve_resources().unwrap();
+    assert_eq!(em.dsel_runtime.get(&2),Some(&(16,4,10,0)));
+    assert_eq!(em.bsel.get(&3).map(|x| x.1.len()),Some(2));
+    let translated = super::translate(&ex).unwrap();
+    assert!(translated.hlsl.contains("tb_dsel16 = 0x4000000u | (s10 + 0x0u)"));
+    assert!(translated.hlsl.contains("tb_dsel16 == 0x4000020u"));
+    println!("BEGIN_HLSL\n{}\nEND_HLSL",translated.hlsl);
+    let mut bad = bounded_cbv_fixture();
+    bad.resources[0].upper = 0;
+    assert!(Emitter::new(&bad,disassemble(&bad.isa)).resolve_resources().is_err());
+    let mut bad = bounded_cbv_fixture();
+    bad.isa.splice(0..0,0xbe850380u32.to_le_bytes()); // clobber base high
+    assert!(Emitter::new(&bad,disassemble(&bad.isa)).resolve_resources().is_err());
+    let mut bad = bounded_cbv_fixture();
+    bad.isa.splice(24..24,0xbe950310u32.to_le_bytes()); // descriptor word escapes
+    assert!(Emitter::new(&bad,disassemble(&bad.isa)).resolve_resources().is_err());
+    let mut bad = bounded_cbv_fixture();
+    bad.isa.splice(0..0,0xbf820000u32.to_le_bytes()); // control-flow boundary
+    assert!(Emitter::new(&bad,disassemble(&bad.isa)).resolve_resources().is_err());
+    let mut bad = bounded_cbv_fixture();
+    bad.root_sig = None;
+    assert!(Emitter::new(&bad,disassemble(&bad.isa)).resolve_resources().is_err());
+    let mut bad = bounded_cbv_fixture();
+    bad.isa[4..8].copy_from_slice(&0x8f0a840au32.to_le_bytes());
+    assert!(Emitter::new(&bad,disassemble(&bad.isa)).resolve_resources().is_err());
+}
