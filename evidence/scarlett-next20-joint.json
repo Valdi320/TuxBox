@@ -1,0 +1,22 @@
+{
+  "upstream_base": "f2184c14e8e847358b586f88c68274fdff7fc315",
+  "source_commit": "b8f063d25ccfd0268280f089d2093ef50c6f4b0a",
+  "merged_locally": [
+    60,
+    61,
+    62,
+    92,
+    93,
+    94
+  ],
+  "already_in_upstream": [
+    90
+  ],
+  "tests": {
+    "python": 226,
+    "shader": 127,
+    "dxbc": 52,
+    "windows": "pass"
+  },
+  "scope": "Joint local CPU/Windows typecheck; GPU controls validated on the individual PRs, not this integrated build"
+}
