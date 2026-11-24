@@ -1,0 +1,95 @@
+{
+  "schema": 1,
+  "source_commit": "47f4b3166553aacc4677fac9d95e8abb711dee21",
+  "upstream_snapshot": "cf95792885030b18b40771bd436c5fefb42fe079",
+  "scope": "Experimental integrated local validation, synthetic requests and GPU controls only; no title launch",
+  "tests": {
+    "python": 204,
+    "shader_compiler": 117,
+    "dxbc_native_bindings": 52,
+    "weak_page_cache_standalone": 2
+  },
+  "cross_target_d3d12_check": "pass",
+  "shader_comparison_and_benchmark": {
+    "scope": "96 synthetic native compute requests; fresh per-request compiler cache; emitter+DXC+DXV; three repetitions per worker count, output digests checked locally; not retail performance",
+    "times_seconds": {
+      "1": [
+        1.4529,
+        1.4678,
+        1.4812
+      ],
+      "2": [
+        0.7365,
+        0.7005,
+        0.7402
+      ],
+      "4": [
+        0.7409,
+        0.3901,
+        0.3821
+      ]
+    },
+    "medians_seconds": {
+      "1": 1.4678,
+      "2": 0.7365,
+      "4": 0.3901
+    },
+    "speedup_vs_one": {
+      "1": 1.0,
+      "2": 1.993,
+      "4": 3.763
+    },
+    "equal_outputs": true,
+    "requests_per_run": 96,
+    "fixed_corpus": {
+      "requests": 9,
+      "before": {
+        "compiled": 4,
+        "refused": 4,
+        "failed": 1
+      },
+      "after": {
+        "compiled": 5,
+        "refused": 3,
+        "failed": 1
+      },
+      "recovered": 1,
+      "regressed": 0,
+      "inconclusive": 1,
+      "candidate_failures_after_success": 0,
+      "tool_sha256": {
+        "baseline": "12268d084ec604a5827cf1b667c50221023946a121b5b180ceddc87045d294f2",
+        "candidate": "1820118e6f44d083bef9e0898241e6c43e0dd5eec1f1abab8afb85038f7f66e4",
+        "dxc": "3dfc856b76291ffc7e45e21fd37ab80e85b34101de76a03253df6608785c92a0",
+        "dxv": "33778294d67143d9f81526f4759c66d5a67a95ea9873448ef3595650a643cbd3"
+      }
+    }
+  },
+  "gpu_smoke": {
+    "source_commit": "610233a",
+    "note": "Built before additional upstream merges cf95792; those later changes passed Python and Rust checks only. The GPU receipt does not certify the final commit.",
+    "adapter": "10de:2704",
+    "receipts": [
+      "d3d12-tables PASS pci=10de:2704 words=16/16 guards=4 heaps=2 rejected=3 placed-srv=16/16 range-copies=4 descriptor-mode=1",
+      "d3d12-stream PASS pci=10de:2704 slot=86 bytes=712 indices=16,32 half-red-blue=18 magenta=18 blue=220 rejected=4",
+      "d3d12-heaps PASS pci=10de:2704 heap=32MiB offsets=0,65536 words=256/256 invalid=4 display=3840x2160/RGB10A2 pixel=c00ffc00 volume=45/45 priorities=4/4 invalid_priority_calls=4",
+      "d3d12-placement PASS pci=10de:2704 slot=44 VA-offsets=0,4096,0 passes=2 BC1-blocks=522 cube-blocks=16404 R8-texels=262144 rejected=3 configured_vm=0"
+    ]
+  },
+  "bruno_runtime_log": {
+    "source": "https://github.com/user-attachments/files/35362806/scarlett-3b11973.log",
+    "first_observed_compute_null_line": 86,
+    "first_observed_raster_null_line": 1482,
+    "reported_lower_bounds": {
+      "compute": 1024,
+      "raster_stream": 2048
+    },
+    "scope": "Sampled lower bounds, not unique failures or proof of cause"
+  },
+  "limitations": [
+    "No archived title requests available for paired real coverage.",
+    "True wave divergence and unrestricted variable descriptor offsets remain open.",
+    "GPU controls are general regressions, not exact reproduction of the three retail failures.",
+    "The integrated #48 conservative stride proof changes acceptance of unproven indexed raw descriptors compared with upstream; real archive comparison required."
+  ]
+}
