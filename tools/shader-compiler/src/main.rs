@@ -35,17 +35,30 @@ fn translate(
     use tuxbox_xshader::{hlsl, meta};
 
     let translated = if let Some(path) = consumer {
-        let pixel = extract(&read(path)?)?;
-        if !matches!(shader.stage, Stage::Vertex | Stage::Geometry) || pixel.stage != Stage::Pixel {
+        let bytes = read(path)?;
+        if !matches!(shader.stage, Stage::Vertex | Stage::Geometry) {
             return Err("expected a vertex or geometry producer and a pixel consumer".into());
         }
-        let pixel = hlsl::translate(&pixel).map_err(Error::Unsupported)?;
-        let order = pixel_order
-            .map(read)
-            .transpose()?
-            .map(|dxil| meta::pixel_input_order(&dxil))
-            .unwrap_or_default();
-        hlsl::translate_ordered(shader, Some(&pixel.ps_input_interp), &order)
+        let actual = pixel_order.map(read).transpose()?;
+        // A portable original consumer has no native ISA to translate. Read
+        // its interpolation directly; retain native consumer handling otherwise.
+        let portable = tuxbox_xshader::psv::portable_pixel_interp(&bytes);
+        let is_portable = portable.is_some();
+        let interp = if let Some(modifiers) = portable {
+            if actual.as_deref().is_some_and(|code| code != bytes.as_slice()) {
+                return Err(Error::Unsupported("portable pixel consumer differs from its bound bytecode".into()));
+            }
+            hlsl::InputInterp(modifiers)
+        } else {
+            let pixel = extract(&bytes)?;
+            if pixel.stage != Stage::Pixel {
+                return Err("expected a pixel consumer".into());
+            }
+            hlsl::translate(&pixel).map_err(Error::Unsupported)?.ps_input_interp
+        };
+        let order = actual.as_deref().map(meta::pixel_input_order)
+            .unwrap_or_else(|| if is_portable { meta::pixel_input_order(&bytes) } else { Vec::new() });
+        hlsl::translate_ordered(shader, Some(&interp), &order)
     } else if let Some(target) = stencil_target {
         hlsl::translate_stencil_target(shader, target)
     } else {

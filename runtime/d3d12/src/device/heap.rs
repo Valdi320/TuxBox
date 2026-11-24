@@ -882,6 +882,10 @@ pub(super) extern "system" fn unregister_pages(device: &Device, token: usize) {
     device.state.page_pools.0.lock().unwrap_or_else(|e| e.into_inner()).remove(&token);
 }
 
+#[path = "heap_page_cache.rs"]
+mod heap_page_cache;
+use heap_page_cache::PageCache;
+
 // Registration returns an opaque cookie. Import the actual slices when a
 // resource uses them, so a large title arena doesn't pin untouched pages.
 #[derive(Default)]
@@ -890,12 +894,12 @@ pub(super) struct PagePools(std::sync::Mutex<std::collections::HashMap<usize, Bo
 struct PagePool {
     start: u64,
     end: u64,
-    last_page: Option<(u64, std::sync::Weak<ImportedHeap>)>,
+    pages: PageCache<ImportedHeap>,
 }
 
 impl PagePools {
     fn register(&self, start: u64, end: u64) -> usize {
-        let pool = Box::new(PagePool { start, end, last_page: None });
+        let pool = Box::new(PagePool { start, end, pages: PageCache::default() });
         let token = core::ptr::from_ref(pool.as_ref()).addr();
         self.0.lock().unwrap_or_else(|e| e.into_inner()).insert(token, pool);
         token
@@ -912,14 +916,9 @@ impl PagePools {
         if size == u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
             let mut pools = self.0.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(pool) = pools.values_mut().find(|pool| pool.start <= base && base + size <= pool.end) {
-                // Nearby suballocations often share one page. The resources
-                // keep their own heap references after this cache advances.
-                if let Some((cached, heap)) = &pool.last_page && *cached == base && let Some(heap) = heap.upgrade() {
-                    return Ok(heap);
-                }
-                let heap = open()?;
-                pool.last_page = Some((base, Arc::downgrade(&heap)));
-                return Ok(heap);
+                // Interleaved allocations can revisit a page whose heap is
+                // still owned by a resource. Reuse only that exact live import.
+                return pool.pages.get_or_open(base, open);
             }
         }
         open()

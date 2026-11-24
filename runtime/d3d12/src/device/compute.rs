@@ -201,7 +201,7 @@ pub(super) unsafe extern "system" fn create_pipeline_x(
             (Some(code), Some(table))
         }
         Some(TableLayout::Original) => (root.and_then(|r| {
-            super::shader_cache::compute_with_root(bytes, r.state.payload())
+            super::shader_cache::compute_for_original_root(bytes, r.state.payload())
         }), None),
         _ => (super::shader_cache::prepared(bytes).or_else(|| {
             super::shader_cache::compute_with_root(bytes, root?.state.payload())

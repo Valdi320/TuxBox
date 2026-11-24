@@ -8,7 +8,7 @@ pub mod hlsl;
 #[cfg(feature = "legacy-hlsl")]
 pub mod meta;
 mod native_compute;
-mod psv;
+pub mod psv;
 pub use tuxbox_dxbc::rdna2;
 pub mod ray;
 use tuxbox_dxbc::rootsig;

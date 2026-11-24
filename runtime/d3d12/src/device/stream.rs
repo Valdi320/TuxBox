@@ -428,14 +428,21 @@ unsafe fn create(
             let (producer_code, Some(i)) = original[producer]? else {
                 return None;
             };
-            let (pixel_code, Some(j)) = original[1]? else {
+            let (pixel_code, _) = original[1]?;
+            let bound = pixel_bytecode();
+            if bound.pShaderBytecode.is_null() || bound.BytecodeLength == 0
+                || bound.BytecodeLength > 64 * 1024 * 1024 {
                 return None;
-            };
+            }
+            // All original and prepared stages (including a redirected stencil
+            // variant) remain live for the entire synchronous stream call.
+            // Hash and check the actual consumer, not the pre-redirection variant.
+            let consumer = unsafe { slice::from_raw_parts(bound.pShaderBytecode.cast::<u8>(), bound.BytecodeLength) };
             shader_cache::link_on_demand(
                 (source, producer_code),
                 (pixel, pixel_code),
                 &stages[i],
-                &stages[j],
+                consumer,
             )
         })
     {

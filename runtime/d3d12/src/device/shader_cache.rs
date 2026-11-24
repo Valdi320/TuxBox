@@ -214,7 +214,8 @@ pub(super) fn link_on_demand(
     producer_dxil: &[u8],
     pixel_dxil: &[u8],
 ) -> Option<Vec<u8>> {
-    if !tuxbox_dxbc::has_packing_mismatch(producer_dxil, pixel_dxil) {
+    if shader_code(pixel_dxil) != Some((Stage::Pixel, ShaderCode::Portable))
+        || !tuxbox_dxbc::has_packing_mismatch(producer_dxil, pixel_dxil) {
         return None;
     }
     let (stage @ (Stage::Vertex | Stage::Geometry), ShaderCode::Portable) =
@@ -222,7 +223,8 @@ pub(super) fn link_on_demand(
     else {
         return None;
     };
-    compile::linked(producer, pixel, pixel_dxil, stage)
+    let linked = compile::linked(producer, pixel, pixel_dxil, stage)?;
+    (!tuxbox_dxbc::has_packing_mismatch(&linked, pixel_dxil)).then_some(linked)
 }
 
 pub(super) fn stencil_target(shader: &[u8], slot: u32) -> Option<Vec<u8>> {
@@ -253,6 +255,18 @@ pub(super) fn prepared(shader: &[u8]) -> Option<Vec<u8>> {
 pub(super) fn compute_with_root(shader: &[u8], root: &[u8]) -> Option<Vec<u8>> {
     let (Stage::Compute, ShaderCode::Xbox) = shader_code(shader)? else { return None };
     translate(&with_root(shader, root)?, Stage::Compute)
+}
+
+/// The original table layout has already been verified. An embedded root
+/// needs the ordinary prepared translation; a rootless program must use
+/// the actual pipeline root (never silently fall back to a rootless variant).
+pub(super) fn compute_for_original_root(shader: &[u8], root: &[u8]) -> Option<Vec<u8>> {
+    let dxbc = tuxbox_dxbc::Dxbc::parse(shader).ok()?;
+    if dxbc.chunk(b"RTS0").is_some() {
+        prepared(shader)
+    } else {
+        compute_with_root(shader, root)
+    }
 }
 
 pub(super) fn raster_with_root(shader: &[u8], root: &[u8]) -> Option<Vec<u8>> {
