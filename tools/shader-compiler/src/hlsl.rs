@@ -28,6 +28,8 @@ mod pixel_quad;
 mod mubuf_offsets;
 #[cfg(test)]
 mod raw_width;
+#[cfg(test)]
+mod wide_atomic_test;
 mod fssm_bindings;
 mod micropoly;
 mod mesh;
@@ -1338,7 +1340,7 @@ fn translate_outputs(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, output_
         em.uav_uint.insert(1);
     }
     if let Some(program) = view_cull { program.resources(&mut em)?; }
-    if (ex.stage == Stage::Compute || (ex.stage == Stage::Pixel && ex.entry.as_deref() == Some("HWRasterizePS")))
+    if matches!(ex.stage, Stage::Compute | Stage::Pixel)
         && em.packed.is_none() && !em.uav_uint.is_empty() {
         em.resolve_wide_image_atomics()?;
     }
@@ -3341,6 +3343,19 @@ impl<'a> Emitter<'a> {
         for (&i, resources) in &self.res {
             let op = &self.insns[i];
             if op.enc != Enc::Mimg {
+                if let Some((_, candidates)) = self.bsel.get(&i) {
+                    for (_, resource) in candidates {
+                        if let Res::Raw(slot, true) | Res::Buf(slot, true) | Res::TBuf(slot, true) = resource {
+                            other.insert(*slot);
+                        }
+                    }
+                }
+                for resource in resources {
+                    if let Res::Uav(slot, _) | Res::Raw(slot, true) | Res::Buf(slot, true)
+                        | Res::TBuf(slot, true) = resource {
+                        other.insert(*slot);
+                    }
+                }
                 continue;
             }
             if let Some(selection) = self.msel.get(&i) {
@@ -3355,8 +3370,14 @@ impl<'a> Emitter<'a> {
                 continue;
             };
             if matches!(op.raw.as_slice(), [0xf05c1308, flags] if flags & 0xc000_0000 == 0)
+                && self.ex.resources.iter().filter(|r| {
+                    matches!(r.res_type, 6..=9)
+                        && r.space == self.binding_spaces.get(&(1, *slot)).copied().unwrap_or(0)
+                        && r.lower <= *slot && *slot <= r.upper
+                }).count() == 1
                 && self.ex.resources.iter().any(|r| {
-                    (r.res_type, r.space, r.lower, r.upper) == (6, 0, *slot, *slot)
+                    (r.res_type, r.space, r.lower, r.upper) ==
+                        (6, self.binding_spaces.get(&(1, *slot)).copied().unwrap_or(0), *slot, *slot)
                 })
             {
                 wide.insert(*slot);
@@ -7022,10 +7043,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 // operand in and the previous value out.
                 if ins.aux.mask == 3 && as_uint && dim == 1 {
                     let visibility = match (self.ex.stage, ins.raw.as_slice()) {
-                        (Stage::Pixel, [0xf05c1308, _]) =>
-                            self.ex.entry.as_deref() == Some("HWRasterizePS")
-                                && self.wide_visibility_uavs.contains(&slot),
-                        (Stage::Compute, [0xf05c1308, _]) => self.wide_visibility_uavs.contains(&slot),
+                        (Stage::Pixel | Stage::Compute, [0xf05c1308, flags])
+                            if flags & 0xc000_0000 == 0 =>
+                                self.wide_visibility_uavs.contains(&slot),
                         _ => false,
                     };
                     if !visibility {
