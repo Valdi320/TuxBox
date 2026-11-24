@@ -34,6 +34,8 @@ mod raw_idxen;
 #[cfg(test)]
 mod wide_atomic_test;
 #[cfg(test)]
+mod cpu_oracle;
+#[cfg(test)]
 mod heap_resinfo;
 #[cfg(test)]
 mod compute_swizzle;
