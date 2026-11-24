@@ -158,35 +158,13 @@ pub(super) fn resource_base(ex: &ShaderExtract) -> Option<u8> {
 /// one the shader declares (PSV) is preferred. `compare` selects comparison
 /// samplers (depth-compare image ops) and only those.
 pub(super) fn inline_sampler(ex: &ShaderExtract, literal: [u32; 4], compare: bool) -> Option<(u32, u32)> {
-    fn address(mode: u32) -> Option<u32> {
-        match mode {
-            1 => Some(0),
-            3 => Some(2),
-            4 => Some(6),
-            _ => None,
-        }
-    }
     let state = |s: &[u32; 13]| -> Option<(u32, u32)> {
-        let [filter, u, v, w, bias, aniso, func, border, min, max, slot, space, vis] = *s;
-        if !(vis == 0 || (vis == 5 && ex.stage == Stage::Pixel))
-            || (bias, aniso, min, max) != (0, 1, 0, 12.0_f32.to_bits())
-            || (filter & 0x80 != 0) != compare
-            || border > 2
-            || !(1..=8).contains(&func)
-            || (!compare && func != 1)
-        {
+        let vis = s[12];
+        if !(vis == 0 || (vis == 5 && ex.stage == Stage::Pixel)) {
             return None;
         }
-        let filter = match filter & 0x7f {
-            0 => 0x14000000,
-            0x14 => 0x14500000,
-            0x15 => 0x18500000,
-            _ => return None,
-        };
-        // DEPTH_COMPARE_FUNC (word 0 bits 12..14) is D3D12_COMPARISON_FUNC - 1;
-        // BORDER_COLOR_TYPE (word 3 bits 30..31) uses the D3D12 static border order.
-        let word0 = address(u)? | address(v)? << 3 | address(w)? << 6 | (func - 1) << 12;
-        (literal == [word0, 0x00c00000, filter, border << 30]).then_some((slot, space))
+        tuxbox_dxbc::inline_sampler::matches_static(literal, s, compare)
+            .then_some((s[10], s[11]))
     };
     let Some(root) = ex.root_sig.as_ref() else {
         // Root-less programs: the title's own root signature supplies the static
