@@ -16,7 +16,7 @@ inline bool valid_pci_id(const wchar_t* value) {
 }
 
 template<class Run>
-int frame_main(int argc, wchar_t** argv, const char* name, bool allow_present, Run run) {
+int frame_main(int argc, wchar_t** argv, const char* name, bool allow_present, Run run, const wchar_t* mode_flag = L"--present", const char* mode_usage = " [--present]") {
     const wchar_t* adapter = nullptr;
     const wchar_t* report = nullptr;
     bool present = false;
@@ -25,11 +25,11 @@ int frame_main(int argc, wchar_t** argv, const char* name, bool allow_present, R
             adapter = argv[++i];
         } else if (!std::wcscmp(argv[i], L"--report") && !report && i + 1 < argc && *argv[i + 1]) {
             report = argv[++i];
-        } else if (allow_present && !std::wcscmp(argv[i], L"--present") && !present) {
+        } else if (allow_present && !std::wcscmp(argv[i], mode_flag) && !present) {
             present = true;
         } else {
             std::fprintf(stderr, "usage: %s.exe [--adapter VVVV:DDDD]%s [--report FILE]\n",
-                         name, allow_present ? " [--present]" : "");
+                         name, allow_present ? mode_usage : "");
             return 2;
         }
     }

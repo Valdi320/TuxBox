@@ -17,6 +17,10 @@ using SetConstants = void (WINAPI*)(ID3D12GraphicsCommandList*, UINT, UINT, cons
 using SetUav = void (WINAPI*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
 using ComputeBudget = void (WINAPI*)(ID3D12GraphicsCommandList*, const UINT*);
 using Flush = void (WINAPI*)(ID3D12GraphicsCommandList*, UINT, UINT64, UINT64);
+using Indirect = void (WINAPI*)(ID3D12GraphicsCommandList*, ID3D12CommandSignature*, UINT,
+                                ID3D12Resource*, UINT64, ID3D12Resource*, UINT64);
+using DriverHint = UINT64 (WINAPI*)(ID3D12GraphicsCommandList*, UINT64, UINT64);
+
 
 HRESULT signature(ID3D12Device* device, UINT kind, UINT stride, ID3D12RootSignature* root,
                   ComPtr<ID3D12CommandSignature>& result) {
@@ -40,9 +44,10 @@ using compute_fixture::buffer;
 using compute_fixture::upload;
 using compute_fixture::transition;
 
-std::string run(const wchar_t* requested, bool) {
+std::string run(const wchar_t* requested, bool scarlett) {
     DXGI_ADAPTER_DESC1 selected{};
-    auto device = create_device(requested, selected, profile_20004.data());
+    auto device = create_device(requested, selected, profile_20004.data(),
+                                scarlett ? __uuidof(ID3D12Device11) : __uuidof(ID3D12Device));
     D3D12_ROOT_PARAMETER params[2]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants = {5, 2, 4};
@@ -107,10 +112,13 @@ std::string run(const wchar_t* requested, bool) {
     auto result = buffer(device.Get(), D3D12_HEAP_TYPE_READBACK, sizeof(expected), D3D12_RESOURCE_STATE_COPY_DEST);
     upload(args.Get(), records, sizeof(records));
     upload(seed.Get(), expected.data(), sizeof(expected));
-    // Use the desktop header for the observed Xbox slot 59, whose arguments match.
+    const auto indirect = method<Indirect>(list.Get(), scarlett ? 61 : 59);
+    // Explicitly exercise the two ABI layouts. The Scarlett tuning hint
+    // is intentionally a no-op and must not poison command recording.
+    const auto hint = scarlett ? method<DriverHint>(list.Get(), 101) : nullptr;
     auto reject = [&](ID3D12CommandSignature* sig, UINT64 offset, ID3D12Resource* count, UINT64 count_offset) {
         check(list->Reset(allocator.Get(), pipeline.Get()), "reset negative list");
-        list->ExecuteIndirect(sig, 1, args.Get(), offset, count, count_offset);
+        indirect(list.Get(), sig, 1, args.Get(), offset, count, count_offset);
         if (list->Close() != E_INVALIDARG) throw std::runtime_error("invalid ExecuteIndirect accepted");
     };
     reject(compute.Get(), sizeof(records) - 4, nullptr, 0);
@@ -144,10 +152,12 @@ std::string run(const wchar_t* requested, bool) {
                         UINT expected_words) {
         const UINT constants[] = {first + 3, 11, first, 24};
         method<SetConstants>(list.Get(), 39)(list.Get(), 0, 4, constants, 0);
-        list->ExecuteIndirect(compute.Get(), max_count, args.Get(), offset, count, count_offset);
+        indirect(list.Get(), compute.Get(), max_count, args.Get(), offset, count, count_offset);
         for (UINT i = 0; i < expected_words; ++i) expected[first + i] = constants[0] + i * constants[1];
     };
     budget(list.Get(), budget_record.data());
+    if (hint && hint(list.Get(), 2, 1) != 0)
+        throw std::runtime_error("unexpected DriverHintX result");
     dispatch(0, 24, 1, nullptr, 0, 24);
     dispatch(28, 12, 2, args.Get(), 36, 8);
     dispatch(40, 24, 1, args.Get(), 40, 0);
@@ -186,7 +196,9 @@ std::string run(const wchar_t* requested, bool) {
     check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "compute fence");
     ID3D12CommandList* batch[] = {list.Get()};
     queue->ExecuteCommandLists(1, batch);
-    check(queue->Signal(fence.Get(), 1), "signal compute fence");
+    using Signal = HRESULT (WINAPI*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
+    check(method<Signal>(queue.Get(), scarlett ? 16 : 14)(queue.Get(), fence.Get(), 1),
+          "signal compute fence");
     compute_fixture::wait_for_fence(fence.Get(), 1);
     D3D12_RANGE read{0, sizeof(expected)}, empty{};
     void* mapped = nullptr;
@@ -196,13 +208,13 @@ std::string run(const wchar_t* requested, bool) {
     if (!match) throw std::runtime_error("indirect dispatch or guarded words differ from CPU reference");
     char receipt[256];
     std::snprintf(receipt, sizeof(receipt),
-                  "d3d12-indirect PASS pci=%04x:%04x sdk=0x20004 device=41 list=59 words=64/64 "
+                  "d3d12-indirect PASS pci=%04x:%04x sdk=0x20004 device=41 list=%u words=64/64 "
                   "counts=direct,one,zero flush=global,range,wake-up(0x3000:0+0xa30000),zero-length,global-range budget=default,rejected2 mesh=0x%08lx rays=0x%08lx",
-                  selected.VendorId, selected.DeviceId, static_cast<unsigned long>(mesh), static_cast<unsigned long>(ray));
+                  selected.VendorId, selected.DeviceId, scarlett ? 61u : 59u, static_cast<unsigned long>(mesh), static_cast<unsigned long>(ray));
     return receipt;
 }
 }
 
 int wmain(int argc, wchar_t** argv) {
-    return tuxbox_test::frame_main(argc, argv, "d3d12-indirect", false, run);
+    return tuxbox_test::frame_main(argc, argv, "d3d12-indirect", true, run, L"--scarlett", " [--scarlett]");
 }
