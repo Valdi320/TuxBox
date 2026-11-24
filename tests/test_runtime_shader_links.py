@@ -242,6 +242,7 @@ class RuntimeShaderLinks(unittest.TestCase):
         with (
             patch("project_tuxbox.runtime_shaders.run_tool", side_effect=run) as compiler,
             patch("project_tuxbox.scarlett_prep.snapshot_compiler_cache", return_value=(self.tools, self.cache)),
+            patch("project_tuxbox.scarlett_prep.report_progress") as prep_report,
         ):
             self.assertTrue(compile_request(source, key, self.tools, old_cache, self.session, remember=remember))
             with self.assertRaises(ShaderRefused):
@@ -254,6 +255,17 @@ class RuntimeShaderLinks(unittest.TestCase):
             self.assertTrue((self.cache / f"{unsupported.stem}.unsupported").is_file())
             self.assertTrue(prepare_for_launch(title, host))
             self.assertEqual(compiler.call_count, 5)
+            import json
+            prefix = "ProjectScarlett preparation aggregate: "
+            reports = [json.loads(call.args[1][len(prefix):])
+                       for call in prep_report.call_args_list if call.args[1].startswith(prefix)]
+            self.assertEqual(len(reports), 2)
+            self.assertEqual(reports[0]["totals"], {"compiled": 1, "cached": 0, "unsupported": 1, "failed": 0})
+            self.assertEqual(reports[0]["refusal_buckets"], {"other_refusal": 1})
+            self.assertEqual(reports[1]["totals"], {"compiled": 0, "cached": 1, "unsupported": 1, "failed": 0})
+            self.assertEqual(reports[1]["refusal_buckets"], {"cached_reason_unavailable": 1})
+            self.assertEqual(reports[1]["request_types"], {".dxbc": 1, ".link": 1})
+            self.assertNotIn(str(directory), json.dumps(reports))
             title.write_bytes(b"a different title build")
             self.assertTrue(prepare_for_launch(title, host))
             self.assertEqual(compiler.call_count, 5)

@@ -623,3 +623,44 @@ python tools/reference/scarlett_resource_fixture.py /tmp/resource-control
 the sampled memory and the improved/negative frame-time controls. In the
 negative control two pairs improve but the third contains 100 ms stalls;
 the all-pairs gate correctly fails despite the improved median.
+
+### Shareable preparation diagnostics
+
+A completed preparation prints one `ProjectScarlett preparation aggregate:`
+JSON line to stderr with checked/compiled/cached/unsupported/failed counts,
+request types, fixed refusal buckets and failure buckets. This does not
+change the compiler, marker format, timeouts or cache behaviour.
+Warm refusal markers retain no reason: these are counted as
+`cached_reason_unavailable`, not guessed. Unknown fresh reasons go into
+`other_refusal`. The aggregate line alone contains no paths, request keys,
+shader data or raw diagnostics; the surrounding normal output may contain
+private paths and should not be shared without review.
+
+For a full fresh emitter-only ranking even on a warm cache, use the existing
+triage tool in aggregate mode against the authorized local request archive:
+
+```sh
+python tools/triage_scarlett_shaders.py "$REQUESTS" --jobs 2 \
+  --aggregate-only --json scarlett-aggregate.json
+```
+
+Here REQUESTS is the recorded requests directory in the title-specific cache.
+Share only the aggregate JSON (and tested commit/tool version separately).
+The existing default detailed triage is still useful privately. Aggregate
+mode uses fixed buckets; unfamiliar messages are deliberately grouped rather
+than publishing arbitrary stderr. Emitter-only success does not imply DXC,
+DXV, driver pipeline creation or gameplay success.
+
+Motivation: [the current-main runtime log in issue #39](https://github.com/brcly/TuxBox/issues/39#issuecomment-7136369501)
+(test commit 3086e0b, log SHA256
+`9d728e2e9d8374702a094e973be03f6528d6c63e906e416594df1188543a5b34`)
+contains 88 distinct explicit live refusals: 57 divergent wave reductions,
+13 EXEC elections, 8 DPP prologues, 6 saveexec prologues, 2 DS swizzles,
+one uninitialized lane read and one dynamic scalar offset. Its separate
+preparation run reports 3,966 unsupported out of 8,692 requests. These are
+different observation populations, not a denominator for the 88 live
+refusals. The runtime log also reports 32 sampled slot-86 stage failures
+(31 E_INVALIDARG, one E_FAIL, all unlinked), 131 host-memory import failure
+messages and three signaller timeouts; none alone establishes root cause.
+The highest remaining request-family ranking needs a fresh local triage,
+not extrapolation from the 88 visible runtime refusals.
