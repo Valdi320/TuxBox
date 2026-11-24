@@ -26,6 +26,7 @@ mod compare;
 mod uniform_texel;
 mod pixel_quad;
 mod mubuf_offsets;
+mod scalar_bits;
 #[cfg(test)]
 mod raw_width;
 #[cfg(test)]
@@ -405,6 +406,7 @@ struct Emitter<'a> {
     res: HashMap<usize, Vec<Res>>, // per-instruction resolved resources
     cb_size: BTreeMap<u32, u32>,   // slot -> dwords
     zero_buffer_offsets: std::cell::OnceCell<BTreeSet<(usize, u8)>>,
+    ordinary_bit_sites: std::cell::OnceCell<BTreeSet<usize>>,
     tex: BTreeMap<u32, u32>,       // slot -> dim
     samp: BTreeSet<u32>,
     samp_cmp: BTreeSet<u32>,
@@ -1742,6 +1744,7 @@ impl<'a> Emitter<'a> {
             res: HashMap::new(),
             cb_size: BTreeMap::new(),
             zero_buffer_offsets: Default::default(),
+            ordinary_bit_sites: Default::default(),
             tex: BTreeMap::new(),
             samp: BTreeSet::new(),
             samp_cmp: BTreeSet::new(),
@@ -4325,6 +4328,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 return Ok(());
             }
         }
+        if scalar_bits::emit(self, idx, ins)? { return Ok(()); }
         match ins.enc {
             Enc::Sopp if matches!(ins.op, 0x24 | 0x25) => {
                 // MODE[7:0] exposes the guest round and denorm settings to S_GETREG.
