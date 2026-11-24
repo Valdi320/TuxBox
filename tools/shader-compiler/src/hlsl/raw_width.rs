@@ -265,3 +265,37 @@ fn bounded_dynamic_cbv_descriptors_select_only_reflected_slots() {
     bad.isa[4..8].copy_from_slice(&0x8f0a840au32.to_le_bytes());
     assert!(Emitter::new(&bad,disassemble(&bad.isa)).resolve_resources().is_err());
 }
+
+#[test]
+fn dynamic_cbv_rejects_incompatible_reflection_and_range_bounds() {
+    use crate::meta::RootParamKind;
+    for variant in 0..8 {
+        let mut ex = bounded_cbv_fixture();
+        let RootParamKind::Table(ranges) = &mut ex.root_sig.as_mut().unwrap().params[0].kind
+            else { panic!("fixture root table") };
+        match variant {
+            0 => ranges[0].range_type = 0, // SRV rather than CBV
+            1 => ranges[0].num = 1, // second candidate out of bounds
+            2 => ranges[0].num = u32::MAX, // unbounded table
+            3 => ranges[0].offset_in_table = 1, // ambiguous physical base
+            4 => ranges[0].base_register = u32::MAX, // register overflow
+            5 => ex.resources[0].space = 1, // reflection space mismatch
+            6 => {
+                ex.resources.push(crate::psv::PsvResource {res_type:2,space:0,lower:1,upper:1});
+            }, // overlapping reflection
+            7 => ex.resources[0].res_type = 4, // wrong resource class
+            _ => unreachable!(),
+        }
+        let mut em = Emitter::new(&ex, disassemble(&ex.isa));
+        assert!(em.resolve_resources().is_err(), "accepted incompatible variant {variant}");
+    }
+    // A mask with five independently possible bits would expand to 32
+    // descriptors; even a large finite range does not bypass the cap.
+    let mut ex = bounded_cbv_fixture();
+    ex.isa[0..4].copy_from_slice(&0x870a9f08u32.to_le_bytes()); // AND 31
+    let RootParamKind::Table(ranges) = &mut ex.root_sig.as_mut().unwrap().params[0].kind
+        else { panic!("fixture root table") };
+    ranges[0].num = 32;
+    ex.resources[0].upper = 31;
+    assert!(Emitter::new(&ex,disassemble(&ex.isa)).resolve_resources().is_err());
+}

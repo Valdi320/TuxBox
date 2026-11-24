@@ -23,6 +23,7 @@ CLAMP = frozenset({
     "v_pk_mad_i16", "v_pk_mad_u16", "v_pk_add_i16", "v_pk_add_u16",
     "v_pk_sub_i16", "v_pk_sub_u16", "v_pk_mul_lo_u16",
 })
+SAT = ("v_sat_pk_u8_i16_e32", "v_sat_pk_u8_i16_e64")
 MASK = 0xffff
 REGS = tuple(range(4, 10))
 
@@ -73,7 +74,14 @@ def execute(initial, instructions):
         if dest not in state or any(s not in state for s in sources):
             raise ValueError("only initialized ordinary VGPRs")
         values=[state[s] for s in sources]
-        if name in SINGLE:
+        if name in SAT:
+            if len(values) != 1 or lo or hi or clamp:
+                raise ValueError("unsupported saturating pack modifiers")
+            # Independent signed-half arithmetic: each signed half maps to
+            # an unsigned byte, with the high destination word cleared.
+            halves = [signed((values[0] // (65536**i)) % 65536) for i in (0,1)]
+            state[dest] = sum(min(255,max(0,value)) * 256**i for i,value in enumerate(halves))
+        elif name in SINGLE:
             if clamp or hi not in (0,1):
                 raise ValueError("unsupported single-half modifier")
             value=result(SINGLE[name],values,lo,lo)&MASK

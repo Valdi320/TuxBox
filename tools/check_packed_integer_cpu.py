@@ -20,12 +20,12 @@ import sys
 import time
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
-from reference.rdna2_packed_integer import FORMS, CLAMP, SINGLE, REGS, execute
+from reference.rdna2_packed_integer import FORMS, CLAMP, SINGLE, REGS, SAT, execute
 
 EDGE=(0,1,0xffff,0x10000,0x7fff8000,0x80007fff,0xffffffff,0xffff0001,
       0x000f0010,0x001f0020,0x80008000,0x7fff7fff)
 VARIANTS=sorted([(name,False) for name in FORMS]+[(name,True) for name in CLAMP])
-ALL_FORMS={**FORMS, **dict.fromkeys(SINGLE,2)}
+ALL_FORMS={**FORMS, **dict.fromkeys(SINGLE,2), **dict.fromkeys(SAT,1)}
 VARIANTS+=sorted((name,False) for name in SINGLE)
 END="s_endpgm"
 ENTRY="[numthreads(1, 1, 1)]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {\n"
@@ -41,6 +41,10 @@ def assembly(initial,ops):
     lines=[f"v_mov_b32_e32 v{r}, 0x{x:08x}" for r,x in zip(REGS,initial)]
     for name,d,sources,lo,hi,clamped in ops:
         n=ALL_FORMS[name]
+        if name in SAT:
+            if n!=1 or lo or hi or clamped:raise ValueError("invalid saturating pack modifiers")
+            lines.append(f"{name} v{d}, v{sources[0]}")
+            continue
         modifiers=(f" op_sel:{selects(lo | (hi<<2),3)}" if name in SINGLE else
                    f" op_sel:{selects(lo,n)} op_sel_hi:{selects(hi,n)}")
         lines.append(f"{name} v{d}, "+", ".join(f"v{s}" for s in sources)
