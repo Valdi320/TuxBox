@@ -1,0 +1,100 @@
+{
+  "scope": "Synthetic DXBC fixtures; CPU-only actual xshader, DXC, DXV. Not a retail coverage estimate.",
+  "tool_sha256": {
+    "baseline": "ca5a4c854e514f1dbee3773269e22f484284d9aafc13034829bff059e42c56ed",
+    "candidate": "7726eac09fa2bffb4f15bcaebfdf8cabb36bda3d22259abcb84fd44c18002fa7",
+    "dxc": "3dfc856b76291ffc7e45e21fd37ab80e85b34101de76a03253df6608785c92a0",
+    "dxv": "33778294d67143d9f81526f4759c66d5a67a95ea9873448ef3595650a643cbd3"
+  },
+  "requests": 5,
+  "before": {
+    "compiled": 2,
+    "refused": 2,
+    "failed": 1
+  },
+  "after": {
+    "compiled": 4,
+    "refused": 0,
+    "failed": 1
+  },
+  "recovered": 2,
+  "regressed": 0,
+  "candidate_failures_after_success": 0,
+  "inconclusive": 1,
+  "transitions": {
+    "compiled": {
+      "compiled": 2,
+      "refused": 0,
+      "failed": 0
+    },
+    "refused": {
+      "compiled": 2,
+      "refused": 0,
+      "failed": 0
+    },
+    "failed": {
+      "compiled": 0,
+      "refused": 0,
+      "failed": 1
+    }
+  },
+  "rows": [
+    {
+      "request": "120a8dc0cb7a01d36a7714d9ff311a0965b63182859b4160ac9c5f6028480c74.dxbc",
+      "before": {
+        "status": "failed",
+        "reason": "xshader failed (N): invalid DXBC magic"
+      },
+      "after": {
+        "status": "failed",
+        "reason": "xshader failed (N): invalid DXBC magic"
+      }
+    },
+    {
+      "request": "54a089f42222b207fc1e697e3e7ae6611740a5ef4c4734b2b463be5279666ded.dxbc",
+      "before": {
+        "status": "compiled",
+        "dxil_sha256": "9d101e7d0b98b308ff9b55e34d6dec00dae349530a0b22490156522e78c5905c"
+      },
+      "after": {
+        "status": "compiled",
+        "dxil_sha256": "9d101e7d0b98b308ff9b55e34d6dec00dae349530a0b22490156522e78c5905c"
+      }
+    },
+    {
+      "request": "58951bc312f6db1a061db1e07b0415ebbe48f50ff7625a35c638021a4b74ad51.dxbc",
+      "before": {
+        "status": "refused",
+        "reason": "wave reduction at 0x_ may execute in divergent control flow"
+      },
+      "after": {
+        "status": "compiled",
+        "dxil_sha256": "e4f9716f1824e6ca6a8431c948b00b5741dd88c97052d17872881716b57f493e"
+      }
+    },
+    {
+      "request": "a71ea29974c7532b6b3f903661dea49eeb1d9085510ceeb2eadc9492addf5f09.dxbc",
+      "before": {
+        "status": "compiled",
+        "dxil_sha256": "9d101e7d0b98b308ff9b55e34d6dec00dae349530a0b22490156522e78c5905c"
+      },
+      "after": {
+        "status": "compiled",
+        "dxil_sha256": "9d101e7d0b98b308ff9b55e34d6dec00dae349530a0b22490156522e78c5905c"
+      }
+    },
+    {
+      "request": "d225324589cae5aba2e46650279eae56c9eea0c7f9908979629156bd73447d14.dxbc",
+      "before": {
+        "status": "refused",
+        "reason": "wave reduction at 0x_ may execute in divergent control flow"
+      },
+      "after": {
+        "status": "compiled",
+        "dxil_sha256": "eba6a2dc40415aca43924b57a026467b41f732db5ea7ccb1a7fc7e17a4795a60"
+      }
+    }
+  ],
+  "baseline_source": "0f6d97c83d21047a6832bae78b4a060ab2aad29b",
+  "candidate_source": "4bdb9713c531844a9021f654b93d678acffc23f3"
+}
