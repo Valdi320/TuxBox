@@ -7,7 +7,8 @@ import re
 from tempfile import TemporaryDirectory
 
 
-def _read_session(path, run_seconds=None):
+def read_frame_times(path, run_seconds=None):
+    """Return valid per-present frame times in ms and skipped row count."""
     times = []
     skipped = 0
     elapsed_ns = 0
@@ -20,7 +21,7 @@ def _read_session(path, run_seconds=None):
             if "fps" in columns and "frametime" in columns:
                 break
         else:
-            return None
+            return [], skipped
         while not columns[-1]:
             columns.pop()
         time_index = columns.index("frametime")
@@ -56,6 +57,11 @@ def _read_session(path, run_seconds=None):
         # MangoHud rounds frame times to six significant digits.
         times = [ms for ms in times if ms <= limit_ms or math.isclose(ms, limit_ms, rel_tol=5e-6)]
         skipped += count - len(times)
+    return times, skipped
+
+
+def _read_session(path, run_seconds=None):
+    times, skipped = read_frame_times(path, run_seconds)
     if not times:
         return None
     times.sort()
