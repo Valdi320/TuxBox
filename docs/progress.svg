@@ -194,6 +194,6 @@
   <g transform="translate(14 1225)">
     <title>Guest regression checks</title>
     <text x="0" y="21" fill="#a0a0b1" font-size="15" text-anchor="start" font-weight="normal">Guest regression checks</text>
-    <text x="972" y="21" fill="#a0a0b1" font-size="15" text-anchor="end" font-weight="normal">47 of 52 passed across 4 host configurations</text>
+    <text x="972" y="21" fill="#a0a0b1" font-size="15" text-anchor="end" font-weight="normal">100 of 105 passed across 5 host configurations</text>
   </g>
 </svg>
