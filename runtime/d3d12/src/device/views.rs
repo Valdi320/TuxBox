@@ -504,7 +504,7 @@ fn buffer_at(device: &Device, address: u64, bytes: u64, stride: u32, required: b
     } else { nearest };
     host.Width = bytes.checked_add(address - page).ok_or(E_INVALIDARG)?;
     if !tight { host.Width = host.Width.checked_next_multiple_of(65536).ok_or(E_INVALIDARG)?; }
-    let (native, heap) = super::heap::import_buffer_with_heap(device, page, &host, D3D12_RESOURCE_STATE_COMMON)?;
+    let (native, heap) = super::heap::import_buffer_with_heap(device, page, &host, D3D12_RESOURCE_STATE_COMMON, "view")?;
     Ok(Some(TextureAddress::with_heap(device, &native, page as usize, false, None, None, None, 0, Some(heap))))
 }
 

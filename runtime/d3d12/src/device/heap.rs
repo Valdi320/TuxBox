@@ -8,6 +8,26 @@ use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, E_POINT
 use windows::Win32::Graphics::Direct3D12::{ID3D12Pageable, *};
 use windows::core::{GUID, HRESULT, Interface};
 
+// This trace identifies which provider path called the native import API.
+// Opt-in and capped; never log the host address or alter the return code.
+fn trace_import_failure(source: &'static str, api: &'static str, size: u64, status: HRESULT) {
+    use crate::diagnostics::{Seen, Sighting};
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("TUXBOX_TRACE_HEAP_IMPORTS").as_deref() == Ok("1")
+    });
+    static SEEN: Seen<(&'static str, &'static str, u64, u32, u64)> = Seen::new(256);
+    if !*ENABLED || !crate::diagnostics::logging() { return; }
+    let caller = crate::survey::title_rva().unwrap_or(0) as u64;
+    let key = (source, api, size, status.0 as u32, caller);
+    match SEEN.sight(&key) {
+        Sighting::New => crate::diagnostics::log(&format!(
+            "heap import failure source={source} api={api} bytes={size} hr={:#010x} caller={caller:#x}", status.0 as u32
+        )),
+        Sighting::Full => crate::diagnostics::log("heap import trace capped at 256 distinct failures"),
+        Sighting::Repeat => (),
+    }
+}
+
 const IMPORTED_HEAP: GUID = GUID::from_u128(0xc2a3c751_1d00_470c_8efd_5da145efd165);
 
 // This holder is also the key for the weak single-page import cache. Its
@@ -282,12 +302,14 @@ pub(super) fn import_buffer(
     address: u64,
     desc: &D3D12_RESOURCE_DESC,
     state: D3D12_RESOURCE_STATES,
+    source: &'static str,
 ) -> windows::core::Result<ID3D12Resource> {
-    import_buffer_with_heap(device, address, desc, state).map(|(resource, _)| resource)
+    import_buffer_with_heap(device, address, desc, state, source).map(|(resource, _)| resource)
 }
 
 pub(super) fn import_buffer_with_heap(
     device: &Device, address: u64, desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_STATES,
+    source: &'static str,
 ) -> windows::core::Result<(ID3D12Resource, Arc<ImportedHeap>)> {
     use windows::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
 
@@ -316,7 +338,7 @@ pub(super) fn import_buffer_with_heap(
     // A guest can place thousands of tiny resources in one multi-GiB XMem
     // reservation. Pin only the pages needed by this resource on the adapter.
     let heap = if let Ok(sized) = device.native.cast::<ID3D12Device13>() {
-        device.state.page_pools.import(&sized, base, size, pin)?
+        device.state.page_pools.import(&sized, base, size, pin, source)?
     } else {
         let mut region = MEMORY_BASIC_INFORMATION::default();
         if unsafe { VirtualQuery(Some(base as _), &mut region, size_of_val(&region)) } == 0
@@ -324,7 +346,11 @@ pub(super) fn import_buffer_with_heap(
             return Err(E_NOTIMPL.into());
         }
         let host: ID3D12Device3 = device.native.cast()?;
-        Arc::new(ImportedHeap { native: unsafe { host.OpenExistingHeapFromAddress(region.AllocationBase)? }, _pin: pin })
+        let native = unsafe { host.OpenExistingHeapFromAddress(region.AllocationBase) }.map_err(|error| {
+            trace_import_failure(source, "legacy", size, error.code());
+            error
+        })?;
+        Arc::new(ImportedHeap { native, _pin: pin })
     };
     let mut resource = None;
     unsafe { device.native.CreatePlacedResource(&heap.native, offset, &host_desc, state, None, &mut resource)? };
@@ -361,9 +387,9 @@ fn device_buffer(device: &Device, desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOU
     native.ok_or(E_POINTER.into())
 }
 
-fn import_or_back(device: &Device, address: u64, desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_STATES)
+fn import_or_back(device: &Device, address: u64, desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_STATES, source: &'static str)
     -> windows::core::Result<ID3D12Resource> {
-    match import_buffer(device, address, desc, state) {
+    match import_buffer(device, address, desc, state, source) {
         Ok(native) => Ok(native),
         Err(error) => {
             let info = unsafe { device.native.GetResourceAllocationInfo(0, std::slice::from_ref(desc)) };
@@ -371,7 +397,7 @@ fn import_or_back(device: &Device, address: u64, desc: &D3D12_RESOURCE_DESC, sta
             let base = address & !0xffff;
             let end = address.saturating_add(bytes).saturating_add(0xffff) & !0xffff;
             if commit_guest_pages(base, end.saturating_sub(base))
-                && let Ok(native) = import_buffer(device, address, desc, state) {
+                && let Ok(native) = import_buffer(device, address, desc, state, source) {
                 static COMMITTED: std::sync::Once = std::sync::Once::new();
                 crate::diagnostics::log_once(&COMMITTED, || format!(
                     "placed buffer at {address:#x} bytes={} committed reserved guest pages", desc.Width));
@@ -445,7 +471,7 @@ pub(super) unsafe extern "system" fn place_virtual(
     if let Err(error) = GPU_APERTURE.wait(address, 1) { return error.code(); }
     let state = super::host_state(initial, desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER);
     if desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && clear.is_null() {
-        let native = import_or_back(device, address, desc, state);
+        let native = import_or_back(device, address, desc, state, "place_virtual");
         return unsafe {
             wrap_pageable(native, &RESOURCE, device,
                 super::ResourceState::from(super::Backing::ConsoleLayout(desc.Layout, desc.Flags)), out)
@@ -552,10 +578,10 @@ pub(super) unsafe extern "system" fn place_virtual_layout(
     } else { (address, 0) };
     let Some(width) = host.Width.checked_add(delta) else { return E_INVALIDARG };
     host.Width = width;
-    let (native, heap) = match import_buffer_with_heap(device, base, &host, D3D12_RESOURCE_STATE_COMMON) {
+    let (native, heap) = match import_buffer_with_heap(device, base, &host, D3D12_RESOURCE_STATE_COMMON, "place_virtual_layout") {
         Ok(resource) => resource,
         Err(error) => {
-            let native = match import_or_back(device, address, desc, D3D12_RESOURCE_STATE_COMMON) {
+            let native = match import_or_back(device, address, desc, D3D12_RESOURCE_STATE_COMMON, "place_virtual_layout") {
                 Ok(native) => native,
                 Err(fallback) => {
                     crate::diagnostics::log(&format!(
@@ -884,9 +910,12 @@ impl PagePools {
         token
     }
 
-    fn import(&self, device: &ID3D12Device13, base: u64, size: u64, pin: ImportPin) -> windows::core::Result<Arc<ImportedHeap>> {
+    fn import(&self, device: &ID3D12Device13, base: u64, size: u64, pin: ImportPin, source: &'static str) -> windows::core::Result<Arc<ImportedHeap>> {
         let open = || -> windows::core::Result<Arc<ImportedHeap>> {
-            let native = unsafe { device.OpenExistingHeapFromAddress1(base as _, size as usize)? };
+            let native = unsafe { device.OpenExistingHeapFromAddress1(base as _, size as usize) }.map_err(|error| {
+                trace_import_failure(source, "sized", size, error.code());
+                error
+            })?;
             Ok(Arc::new(ImportedHeap { native, _pin: pin }))
         };
         if size == u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {

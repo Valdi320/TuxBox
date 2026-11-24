@@ -278,3 +278,30 @@ register/flag values in total). Negative controls reject unknown SCC,
 EXEC-derived SCC and unproven high halves. See
 [evidence](../evidence/scarlett-dependent-scalar-chains.json). No GPU or
 retail compatibility claim.
+
+### Investigate allocation-size mismatches
+
+For a diagnostic launch, set `TUXBOX_LOG=stderr` and
+`TUXBOX_TRACE_ALLOCATION_BYTES=8192,16384,invalid` before the normal offline
+launch command. Rebuild and restage the provider first. The optional trace
+reports exact selected allocation sizes (decimal or 0x-prefixed hex), including
+the failing size sentinel with `invalid`. It records the title-relative caller,
+resource descriptions and returned alignment, not resource contents. Repeated
+records are deduplicated; at most 256 distinct records and eight descriptions
+per record are emitted. Lines share an ID to correlate interleaved threads.
+No allocation decisions are changed. This is intended to help locate the
+source of a size mismatch, not to bypass the title's assertion.
+
+
+For host heap import failures, set `TUXBOX_TRACE_HEAP_IMPORTS=1` and
+`TUXBOX_LOG=stderr` after rebuilding/restaging the provider. This optional
+trace identifies the failing native heap-open API (sized or legacy), the
+provider caller path (virtual placement, layout placement or view), requested
+bytes, HRESULT and title-relative caller. It omits host addresses and
+resource data, deduplicates the first 256 distinct failure keys, and does
+not change allocation, lifetime, fallback or error-return behavior. It
+does not trace imports performed internally by the desktop driver.
+The issue #39 log contains 262 failed driver allocation attempts and
+131 host import failure messages, not a confirmed VRAM exhaustion or
+a proven fault in these provider call sites. The opt-in trace is intended
+to distinguish those possibilities in a subsequent authorized run.

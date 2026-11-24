@@ -8,6 +8,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::core::Interface;
 
+mod trace;
+
 const _: () = assert!(
     size_of::<D3D12_RESOURCE_DESC>() == 56 && size_of::<D3D12_RESOURCE_ALLOCATION_INFO>() == 16
 );
@@ -63,6 +65,24 @@ pub(super) unsafe extern "system" fn custom_heap_properties(
 }
 
 pub(super) unsafe extern "system" fn info(
+    out: *mut D3D12_RESOURCE_ALLOCATION_INFO,
+    device: &Device,
+    visible: u32,
+    count: u32,
+    descs: *const D3D12_RESOURCE_DESC,
+) -> *mut D3D12_RESOURCE_ALLOCATION_INFO {
+    let result = unsafe { info_impl(out, device, visible, count, descs) };
+    if trace::enabled() && !result.is_null() && !descs.is_null() && count != 0 && visible <= 1 {
+        let answer = unsafe { &*result };
+        if trace::matches(answer.SizeInBytes) {
+            let items = unsafe { slice::from_raw_parts(descs, count as usize) };
+            trace::report("info", items, answer);
+        }
+    }
+    result
+}
+
+unsafe fn info_impl(
     out: *mut D3D12_RESOURCE_ALLOCATION_INFO,
     device: &Device,
     visible: u32,
@@ -217,6 +237,14 @@ pub(super) unsafe extern "system" fn info2(
             }
             unsafe { host.GetResourceAllocationInfo2(visible, 1, &native, None) }
         } else { return out };
+        if trace::matches(requirement.SizeInBytes) {
+            let guest = D3D12_RESOURCE_DESC {
+                Dimension: d.Dimension, Alignment: d.Alignment, Width: d.Width, Height: d.Height,
+                DepthOrArraySize: d.DepthOrArraySize, MipLevels: d.MipLevels, Format: d.Format,
+                SampleDesc: d.SampleDesc, Layout: d.Layout, Flags: d.Flags,
+            };
+            trace::report("info2-item", core::slice::from_ref(&guest), &requirement);
+        }
         if requirement.Alignment == 0 || requirement.SizeInBytes == u64::MAX {
             crate::diagnostics::recording_error(format_args!("allocation info2 dim={} {}x{} format={} flags={:#x} layout={:#x} alignment={}", d.Dimension.0, d.Width, d.Height, d.Format.0, d.Flags.0, d.Layout.0, d.Alignment));
             return out;
