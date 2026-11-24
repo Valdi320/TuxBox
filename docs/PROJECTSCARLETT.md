@@ -171,3 +171,18 @@ refusals from the public #39 log; real compiler comparisons of nine synthetic
 requests; five protected successes, three deliberately lost successes
 detected on downgrade, and three overlapping ownership hints in a synthetic
 coordination control. No title data or game execution was needed.
+
+
+
+### Investigate allocation-size mismatches
+
+For a diagnostic launch, set `TUXBOX_LOG=stderr` and
+`TUXBOX_TRACE_ALLOCATION_BYTES=8192,16384,invalid` before the normal offline
+launch command. Rebuild and restage the provider first. The optional trace
+reports exact selected allocation sizes (decimal or 0x-prefixed hex), including
+the failing size sentinel with `invalid`. It records the title-relative caller,
+resource descriptions and returned alignment, not resource contents. Repeated
+records are deduplicated; at most 256 distinct records and eight descriptions
+per record are emitted. Lines share an ID to correlate interleaved threads.
+No allocation decisions are changed. This is intended to help locate the
+source of a size mismatch, not to bypass the title's assertion.
