@@ -398,3 +398,83 @@ both arms; cache primed once) measured 4.63 s vs 0.47 s median on the
 local machine. This is repeat validation with an unchanged toolchain,
 not faster cold discovery or a claim of higher FPS. The campaign remains
 deliberately narrow: no memory, wave execution, branches or GPU testing.
+
+
+## Offline launch and visual diagnostics
+
+These tools consume existing logs or captures; neither starts the title,
+touches the Wine prefix, changes driver settings, or uses a GPU.
+
+### Locate a launch failure
+
+```sh
+python tools/diagnose_scarlett_run.py build/scarlett.log --json build/diagnosis.json
+```
+
+The diagnostic reads the launcher's actual status format, including appended
+sessions, recorded D3D12 milestones, shader compiler outcomes, explicit
+pipeline/resource/command failures, missing imports, survey call-site RVAs
+and unhandled Wine exceptions. It reports line numbers and timestamps
+where available, counts diagnostic events separately from distinct shader
+requests, and suggests the next check for each observed fault type. Terminal
+exception/device-loss evidence is listed first, then recent diagnostic
+groups by line number; this is an investigation order, not causal ranking.
+An absolute fault address is not a title RVA. Survey asserts that were
+continued are not terminal errors. A missing exit record remains incomplete,
+not a diagnosed hang. The first presentation does not prove visible output.
+The input file should be complete and stable; mixed process output cannot
+establish exact timing or causal attribution. Files over 512 MiB are rejected
+and lines over 64 KiB are counted and skipped. Reports omit raw log messages
+and paths, but may include module names and addresses; review before sharing.
+
+In the public issue #39 log, the tool identifies the first presentation at
+line 514, page mapping at 548, the slot 86 module-not-found HRESULT at 541,
+64 logged compute-pipeline failure events and 836 distinct refused shaders.
+The log has no exit record; the missing module is not identified by its
+HRESULT, and these observations do not establish the ultimate stop.
+
+### Compare rendered frames
+
+Use a Python environment with Pillow installed (the existing project
+requirements are unchanged; the frame analysis is optional).
+Capture reference and candidate at the same camera, resolution, frame,
+UI state and color settings, preferably lossless RGB or RGBA 8-bit SDR PNG.
+The tool cannot automatically establish this equivalence.
+
+```sh
+python tools/compare_scarlett_frames.py reference.png candidate.png \
+    --json frame-comparison.json --heatmaps frame-errors
+```
+
+For a sequence, pass two directories of equally named PNGs; names must
+match exactly. The tool compares in lexicographic name order and counts
+adjacent identical pixel digests, not elapsed time or proven freezes.
+Dimensions, color metadata and modes must match. No automatic alignment,
+resizing or color conversion. RGBA compares all four straight channels,
+including transparent RGB. Optional `--roi X0 Y0 X1 Y1` uses half-open
+coordinates to exclude deliberately chosen UI/overlay areas.
+
+Default gates require exact agreement. Set `--tolerance` to a maximum
+per-channel integer difference and both `--max-fraction` and
+`--max-tile-fraction` to the allowed fraction of pixels exceeding it,
+globally and in each tile. Choose thresholds before testing; the local
+gate protects small defects from being hidden by global averages.
+The report includes MAE, MSE, PSNR (null for exact equality), bounding box,
+worst tiles, pixel digests, near-black/flat-color observations and optional
+absolute-error grayscale PNGs (0=no difference, 255=maximum difference).
+It returns 1 for a failed comparison, 2 for invalid input. Output paths
+must be fresh. Maximum capture size is 16,777,216 pixels and maximum
+sequence length 256 pairs. HDR/16-bit captures, animation, perceptual
+quality and gameplay assessment are out of scope.
+
+Reproduce six synthetic 4K comparisons and two independent launch sessions:
+
+```sh
+python tools/reference/scarlett_observability_fixture.py /tmp/observability-control
+```
+
+[Validation receipt](../evidence/scarlett-observability.json) includes the
+public log fingerprint, controlled diagnostic outcomes and six 4K pairs
+(identical, one changed pixel, local defect, black, tolerated one-level
+changes, and swapped color channels). These are CPU-side checks, not real
+title rendering comparisons.
