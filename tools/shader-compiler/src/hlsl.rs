@@ -451,6 +451,7 @@ struct Emitter<'a> {
     view_cull: Option<instance_cull_views::ViewProgram>,
     /// The shader uses wave intrinsics (needs shader model 6: DXC only).
     required_wave_size: Option<u32>,
+    portable_wave64: bool,
     msel: HashMap<usize, MSel>,
     /// Buffer ops (MUBUF, s_buffer_load) whose descriptor register holds one of several
     /// descriptors: (register key, candidates as (descriptor id, resource)).
@@ -1263,6 +1264,16 @@ fn translate_outputs(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, output_
             return Err(format!("wave operation requires complete {width}-lane compute waves"));
         }
     }
+    em.portable_wave64 = required_wave_size == Some(64)
+        && ex.stage == Stage::Compute && compute_group(ex) == [64, 1, 1]
+        && !wave_cull && !page_waves && !allocation_wave64 && !requires_ballot
+        && !em.compute_swizzle && !em.indexed_lane && !em.compute_heap
+        && em.packed.is_none() && !uses_quad_add && !uses_bpermute && !probe_trace
+        && scan_width.is_none() && !particle_sort && !hair_cluster_export && !hair_cluster
+        && !instance_cull && !hzb_cull && view_cull.is_none() && !post_cull
+        && !hair_visibility_indirect && !hair_visibility_single && hair_compact.is_none()
+        && !subsurface_setup && !material_classify && !classify_tiles && !reflection && !group_extrema
+        && wave_sum::portable_single_wave(&em.insns);
     if is_ps {
         em.find_export_epilogs();
         em.classify_interpolation();
@@ -1373,6 +1384,7 @@ fn translate_outputs(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, output_
         hlsl.insert_str(0, instance_cull_hzb::HIDDEN_DECLARATIONS);
     }
     if light_grid { hlsl.insert_str(0, light_grid::DECLARATIONS); }
+    if em.portable_wave64 { hlsl.insert_str(0, wave_sum::PORTABLE_DECLARATIONS); }
     if page_waves || wave_cull {
         if fspx_wave == Some(32) {
             hlsl.insert_str(0, fspx_wave::WAVE32);
@@ -1417,8 +1429,8 @@ fn translate_outputs(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, output_
         needs_barycentrics: !em.pulled_attrs.is_empty(),
         packed_dot_product: fspx_wave.is_some(),
         typed_int64_atomics: !em.wide_visibility_uavs.is_empty() || em.packed.as_ref().is_some_and(|p| !p.wide_images.is_empty()),
-        required_wave_size,
-        portable_compute_group: portable_compute_group.or(light_grid.then(|| compute_group(ex))),
+        required_wave_size: if em.portable_wave64 { None } else { required_wave_size },
+        portable_compute_group: portable_compute_group.or((light_grid || em.portable_wave64).then(|| compute_group(ex))),
         ps_input_interp: std::mem::take(&mut em.ps_in_interp),
     })
 }
@@ -1749,6 +1761,7 @@ impl<'a> Emitter<'a> {
             micropoly_vote: None,
             view_cull: None,
             required_wave_size: None,
+            portable_wave64: false,
             msel: HashMap::new(),
             bsel: HashMap::new(),
             dsel_loads: HashMap::new(),
@@ -5267,7 +5280,10 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             let t = self.tmp;
             self.tmp += 1;
             let acc = r(&s[0])?;
-            let partner = format!("WaveReadLaneAt({acc}, {lane})");
+            let partner = if self.portable_wave64 {
+                let lane = lane.replace("WaveGetLaneIndex()", "gtid.x");
+                format!("tb_reduction_read(gtid.x, {acc}, {lane})")
+            } else { format!("WaveReadLaneAt({acc}, {lane})") };
             let combined = match m.as_str() {
                 "v_add_nc_u32" => format!("{partner} + {acc}"),
                 "v_and_b32" => format!("{partner} & {acc}"),
@@ -5288,7 +5304,11 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 let width = self.required_wave_size.ok_or("missing width for scan lane read")?;
                 format!("({lane} & {}u)", width - 1)
             } else { lane };
-            return self.ws(&d, &format!("WaveReadLaneAt({}, {lane})", r(&s[0])?));
+            let value = r(&s[0])?;
+            let read = if self.portable_wave64 {
+                format!("tb_reduction_read(gtid.x, {value}, {lane})")
+            } else { format!("WaveReadLaneAt({value}, {lane})") };
+            return self.ws(&d, &read);
         }
         if is_quad_exchange(ins) {
             if ins.op == OP_QUAD_MOVE { return self.wv(&d, &format!("q{}", self.cur_idx)); }
@@ -5907,6 +5927,17 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 return Err("permlanex16 modifiers unsupported".into());
             }
             let (value, lo, hi) = (r(&s[0])?, r(&s[1])?, r(&s[2])?);
+            if self.portable_wave64 {
+                // portable_single_wave permits only the recognized cross-row
+                // exchange inside a full-EXEC reduction with selectors zero.
+                if s[1..] != [Opnd::ConstInt(0), Opnd::ConstInt(0)] {
+                    return Err("unverified portable wave64 cross-row selectors".into());
+                }
+                let t = self.tmp;
+                self.tmp += 1;
+                self.line(&format!("uint t{t} = tb_reduction_read(gtid.x, {value}, (gtid.x & ~15u) ^ 16u);"));
+                return self.wv(&d, &format!("t{t}"));
+            }
             let t = self.tmp;
             self.tmp += 1;
             self.line(&format!("uint t{t}lane = WaveGetLaneIndex(); uint t{t}sel = (t{t}lane & 8u) ? {hi} : {lo};"));
@@ -7895,7 +7926,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             if self.compute_swizzle || self.indexed_lane {
                 writeln!(h, "groupshared uint tb_swizzle[{}];", tx * ty_ * tz).unwrap();
             }
-            if let Some(width) = self.required_wave_size { writeln!(h, "[WaveSize({width})]").unwrap(); }
+            if let Some(width) = self.required_wave_size.filter(|_| !self.portable_wave64) {
+                writeln!(h, "[WaveSize({width})]").unwrap();
+            }
             // These kernels enable all 64 lanes for a reduction. Start the extra
             // rows inactive so they never participate in the guest's memory work.
             let padded = self.wave_cull && matches!([tx, ty_, tz], [4, 4, 1] | [32, 1, 1]);
