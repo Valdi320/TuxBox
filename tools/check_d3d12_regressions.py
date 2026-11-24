@@ -24,6 +24,7 @@ CASES = {
     "indirect": ("d3d12-indirect", (), "d3d12-indirect", ("list=59", "words=64/64")),
     "indirect-scarlett": ("d3d12-indirect", ("--scarlett",), "d3d12-indirect", ("list=61", "words=64/64")),
     "null-usage": ("d3d12-null-usage", (), "d3d12-null-usage", ("words=64/64", "recorded=64", "valid=2")),
+    "null-disabled": ("d3d12-null-usage", ("--reject",), "d3d12-null-disabled", ("rejected=1", "valid=1")),
 }
 DEFAULT = tuple(name for name in CASES if name not in ("indirect-scarlett", "mesh"))
 DIGEST = hashlib.sha256(bytes.fromhex("78563412efcdab90")).hexdigest()
@@ -37,9 +38,22 @@ def sha(path):
 def validate(case, adapter, status, output):
     _, _, name, markers = CASES[case]
     prefix = f"{name} PASS pci={adapter.lower()} "
-    passes = [line for line in output.splitlines() if line.lower().startswith(prefix.lower())]
-    if status or len(passes) != 1 or any(marker not in passes[0].split() for marker in markers):
+    lines = output.splitlines()
+    # A success line from another case or adapter is contradictory, not a
+    # second independent pass. Do not accept duplicate receipt fields.
+    passes = [line for line in lines if re.match(r"(?:d3d12-|xbox-frame)[a-z0-9-]* PASS ", line)]
+    if status or len(passes) != 1 or not passes[0].lower().startswith(prefix.lower()):
         return False, None
+    fields = passes[0].split()[2:]
+    keys = [field.split("=", 1)[0] for field in fields]
+    if len(set(keys)) != len(keys) or any(marker not in fields for marker in markers):
+        return False, None
+    fallback = [line for line in lines if "TuxBox d3d12_xs: substituted null " in line]
+    if case != "null-usage":
+        # A compatibility control must exercise the real pipeline, not a
+        # successful no-op substitution (even if its output happens to match).
+        if fallback or any("TuxBox d3d12_xs: null usage rank " in line for line in lines):
+            return False, passes[0]
     if case == "null-usage":
         # Driver output may interleave; only accept complete exact records.
         summaries = [line.split("TuxBox d3d12_xs: ",1)[1] for line in output.splitlines()
@@ -51,7 +65,10 @@ def validate(case, adapter, status, output):
         for interval,count in ((1,1),(2,63)):
             expected.append(f"null usage interval recorded={count} display_bound=0 tracked=1 overflow=0 overflow_display_bound=0 compute={count} raster=0 interval={interval} trigger=recording_checkpoint")
             expected_ranks.append(f"null usage rank kind=compute CS={DIGEST} recorded={count} display_bound=0 interval={interval} trigger=recording_checkpoint")
-        if sorted(summaries)!=sorted(expected) or sorted(ranks)!=sorted(expected_ranks):
+        if (sorted(summaries)!=sorted(expected) or sorted(ranks)!=sorted(expected_ranks)
+                or sorted(fallback) != sorted(
+                    f"TuxBox d3d12_xs: substituted null compute pipeline for an untranslated shader ({n} so far)"
+                    for n in (1,2))):
             return False, passes[0]
     return True, passes[0]
 
@@ -83,7 +100,8 @@ def main(argv=None):
                "d3d12core.dll":libs/"vkd3d-proton/x86_64-windows/d3d12core.dll",
                "dxgi.dll":libs/"dxvk/x86_64-windows/dxgi.dll",
                "dxcompiler.dll":a.compiler_dir/"dxcompiler.dll",
-               "dxil.dll":a.compiler_dir/"dxil.dll"}
+               "dxil.dll":a.compiler_dir/"dxil.dll",
+               "wine":wine,"wineserver":files/"bin/wineserver"}
     artifacts.update({CASES[c][0]+".exe":a.build_dir/(CASES[c][0]+".exe") for c in selected})
     if any(not p.is_file() for p in (*artifacts.values(),wine)):
         ap.error("missing build, Proton or compiler artifact")
@@ -106,7 +124,8 @@ def main(argv=None):
             env={"WINEPREFIX":trial/"prefix","WINESERVER":files/"bin/wineserver",
                  "WINEDEBUG":"-all","VKD3D_DEBUG":"warn","WINEDLLOVERRIDES":"d3d12,d3d12core,dxgi=n,b",
                  "XDG_CACHE_HOME":trial/"cache","XDG_RUNTIME_DIR":trial/"runtime","TMPDIR":trial/"tmp",
-                 "VKD3D_SHADER_CACHE_PATH":trial,"TUXBOX_LOG":"stderr","TUXBOX_TRACE_PRESENT":"1"}
+                 "VKD3D_SHADER_CACHE_PATH":trial,"TUXBOX_LOG":"stderr","TUXBOX_TRACE_PRESENT":"1",
+                 "TUXBOX_NULL_PIPELINES":"1" if case=="null-usage" else "0"}
             cmd=["bwrap","--die-with-parent","--unshare-pid","--unshare-net","--ro-bind","/","/",
                  "--dev-bind","/dev","/dev","--proc","/proc","--tmpfs","/tmp","--bind",str(trial),str(trial),
                  "--unsetenv","WAYLAND_DISPLAY","--chdir",str(trial)]
@@ -124,7 +143,8 @@ def main(argv=None):
             # Logs are local only; the JSON receipt contains a fixed case
             # name, exit status and the known fixture's synthetic PASS line.
             ok,receipt=validate(case,a.adapter,status,log.read_text(errors="replace"))
-            rows.append(dict(case=case,passed=ok,exit=status,seconds=round(monotonic()-start,3),receipt=receipt))
+            rows.append(dict(case=case,passed=ok,exit=status,seconds=round(monotonic()-start,3),receipt=receipt,
+                             null_fallback_enabled=case=="null-usage"))
             print(case,"PASS" if ok else "FAIL",flush=True)
     unchanged=fingerprints=={k:sha(p) for k,p in artifacts.items()}
     report=dict(schema=1,scope="Synthetic D3D12 provider controls; not retail execution",

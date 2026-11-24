@@ -15,7 +15,7 @@ using Pipeline = HRESULT (WINAPI*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_S
 using SetRoot = void (WINAPI*)(ID3D12GraphicsCommandList*, ID3D12RootSignature*);
 using SetConstants = void (WINAPI*)(ID3D12GraphicsCommandList*, UINT, UINT, const void*, UINT);
 using SetUav = void (WINAPI*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
-std::string run(const wchar_t* requested, bool) {
+std::string run(const wchar_t* requested, bool disabled) {
     DXGI_ADAPTER_DESC1 selected{};
     auto device = create_device(requested, selected);
     D3D12_ROOT_PARAMETER params[2]{};
@@ -35,6 +35,16 @@ std::string run(const wchar_t* requested, bool) {
     shader.CS = {invalid_shader, sizeof(invalid_shader)};
     ComPtr<ID3D12PipelineState> unused, substitute, good;
     auto create = method<Pipeline>(device.Get(), 62);
+    if (disabled) {
+        const auto hr = create(device.Get(), &shader, 0, nullptr, IID_PPV_ARGS(&unused));
+        if (SUCCEEDED(hr) || unused) throw std::runtime_error("invalid shader accepted with fallback disabled");
+        shader.CS = {affine_dxil, sizeof(affine_dxil)};
+        check(create(device.Get(), &shader, 0, nullptr, IID_PPV_ARGS(&good)), "valid control after rejection");
+        if (!good) throw std::runtime_error("valid pipeline missing after rejection");
+        char receipt[128];
+        std::snprintf(receipt,sizeof(receipt),"d3d12-null-disabled PASS pci=%04x:%04x rejected=1 valid=1",selected.VendorId,selected.DeviceId);
+        return receipt;
+    }
     check(create(device.Get(), &shader, 0, nullptr, IID_PPV_ARGS(&unused)), "unused fallback");
     check(create(device.Get(), &shader, 0, nullptr, IID_PPV_ARGS(&substitute)), "used fallback");
     shader.CS = {affine_dxil, sizeof(affine_dxil)};
@@ -101,5 +111,8 @@ std::string run(const wchar_t* requested, bool) {
 }
 }
 int wmain(int argc,wchar_t** argv) {
+    if (argc > 1 && !std::wcscmp(argv[1], L"--reject"))
+        return tuxbox_test::frame_main(argc-1,argv+1,"d3d12-null-disabled",false,
+            [](const wchar_t* adapter, bool) { return run(adapter,true); });
     return tuxbox_test::frame_main(argc,argv,"d3d12-null-usage",false,run);
 }
