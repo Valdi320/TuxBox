@@ -12,6 +12,7 @@ from .inspect import digest
 from .prep_progress import PrepPhase, desktop_progress, report_progress
 from .runtime_shaders import REQUEST_PATTERNS, ShaderRefused, compile_request, snapshot_compiler_cache
 from .shader_prep import SOURCE_CACHE
+from .shader_diagnostics import normalize_refusal
 
 
 def scarlett_requests(executable, cache):
@@ -38,6 +39,7 @@ def prepare_scarlett(executable, host):
 
     started = monotonic()
     totals = Counter()
+    reasons = Counter()
     # Use the runtime toolchain and cache so the guest can load both translations
     # and deterministic refusals directly, including requests with a pipeline root.
     env = {"TUXBOX_SHADER_PREP_UI": "1", **host.env}
@@ -49,26 +51,37 @@ def prepare_scarlett(executable, host):
         def compile_one(source):
             try:
                 compiled = compile_request(source, source.stem, tools, cache, None)
-                return ("compiled" if compiled else "cached"), None
-            except ShaderRefused:
-                return "unsupported", None
+                return ("compiled" if compiled else "cached"), None, None
+            except ShaderRefused as exc:
+                if exc.cached:
+                    return "unsupported_cached", None, None
+                return "unsupported", None, normalize_refusal(str(exc))
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                return "failed", f"{source.name}: {exc}"
+                return "failed", f"{source.name}: {exc}", None
 
         workers = ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 1))
         try:
             pending = [workers.submit(compile_one, source) for source in sources]
             for completed, result in enumerate(as_completed(pending), 1):
-                category, error = result.result()
+                category, error, reason = result.result()
                 totals[category] += 1
+                if reason is not None:
+                    reasons[reason] += 1
                 if error and totals["failed"] <= 3:
                     report_progress(progress, f"ProjectScarlett shader preparation: {error}", completed, len(sources))
-                phase.update(completed, totals["compiled"], unsupported=totals["unsupported"], failed=totals["failed"])
+                phase.update(completed, totals["compiled"],
+                             unsupported=totals["unsupported"] + totals["unsupported_cached"], failed=totals["failed"])
         finally:
             workers.shutdown(cancel_futures=True)
 
         elapsed = monotonic() - started
+        unsupported = totals["unsupported"] + totals["unsupported_cached"]
         report_progress(progress, f"ProjectScarlett shader preparation took {elapsed:.1f}s. "
                         f"{totals['compiled']} compiled, {totals['cached']} cached, "
-                        f"{totals['unsupported']} unsupported, {totals['failed']} failed.", 1, 1)
+                        f"{unsupported} unsupported, {totals['failed']} failed.", 1, 1)
+    if unsupported:
+        report_progress(None, f"ProjectScarlett shader refusals: {totals['unsupported']} new, "
+                        f"{totals['unsupported_cached']} cached (reason unavailable).")
+        for reason, count in sorted(reasons.items(), key=lambda item: (-item[1], item[0]))[:10]:
+            report_progress(None, f"  {count} x {reason}")
     return True
