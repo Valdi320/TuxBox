@@ -12,8 +12,13 @@
 //!
 //! Each distinct site is logged once, with a running hit count at powers of two.
 //! This is a diagnostic mode: rendering may be wrong after the first failure.
+use core::ffi::c_void;
+use core::ptr;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{LazyLock, Mutex, Once};
-use windows::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, HMODULE};
+use windows::Win32::Foundation::{
+    EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION, HMODULE,
+};
 use windows::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_POINTERS, RtlCaptureStackBackTrace, RtlPcToFileHeader,
 };
@@ -21,6 +26,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 
 const CONTINUE_EXECUTION: i32 = -1;
 const CONTINUE_SEARCH: i32 = 0;
+
+static VEH_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 pub(crate) fn enabled() -> bool {
     static ENABLED: LazyLock<bool> =
@@ -41,14 +48,38 @@ fn is_recoverable(rva: usize, bytes: &[u8]) -> bool {
     RECOVERABLE.iter().any(|&(site, expected)| rva == site && bytes == expected)
 }
 
-/// Install the assert handler once, when the title creates its first device.
-/// Outside survey mode the handler only steps over `RECOVERABLE`.
-pub(crate) fn install() {
+/// Register the vectored exception handler once. Safe to call from `DllMain`
+/// so early title code (such as `clwb` on pre-Ice Lake CPUs) is covered before
+/// the first device is created.
+pub(crate) fn install_handler() -> bool {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
         let handle = unsafe { AddVectoredExceptionHandler(1, Some(handler)) };
+        VEH_HANDLE.store(handle, Ordering::Release);
+    });
+    !VEH_HANDLE.load(Ordering::Acquire).is_null()
+}
+
+/// Remove the vectored exception handler when `d3d12_xs.dll` is dynamically
+/// unloaded.
+#[cfg(not(test))]
+pub(crate) fn uninstall_handler() {
+    use windows::Win32::System::Diagnostics::Debug::RemoveVectoredExceptionHandler;
+    let handle = VEH_HANDLE.swap(ptr::null_mut(), Ordering::AcqRel);
+    if !handle.is_null() {
+        unsafe { RemoveVectoredExceptionHandler(handle) };
+    }
+}
+
+/// Install the assert handler once, when the title creates its first device.
+/// Outside survey mode the handler only steps over `RECOVERABLE` and rewrites
+/// unsupported `clwb` instructions.
+pub(crate) fn install() {
+    let installed = install_handler();
+    static LOGGED: Once = Once::new();
+    LOGGED.call_once(|| {
         if enabled() {
-            log(format!("survey mode active (assert handler installed: {})", !handle.is_null()));
+            log(format!("survey mode active (assert handler installed: {installed})"));
         }
     });
 }
@@ -91,6 +122,14 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     else {
         return CONTINUE_SEARCH;
     };
+    if record_.ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION {
+        if let Some((start, end)) = title_image() {
+            if crate::clwb::handle_illegal_instruction(context, start, end) {
+                return CONTINUE_EXECUTION;
+            }
+        }
+        return CONTINUE_SEARCH;
+    }
     if record_.ExceptionCode == EXCEPTION_ACCESS_VIOLATION {
         if enabled() {
             describe_fault(context);

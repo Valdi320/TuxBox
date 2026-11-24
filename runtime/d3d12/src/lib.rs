@@ -1,6 +1,7 @@
 //! Guest device-factory ABI for d3d12_xs.dll.
 
 mod big_stack;
+mod clwb;
 mod commands;
 mod device;
 mod diagnostics;
@@ -164,3 +165,30 @@ pub unsafe extern "system" fn tuxbox_create_device(
     // SAFETY: The local profile remains live until the factory returns.
     unsafe { create_device(adapter, params.as_ptr().cast(), iid, out) }
 }
+
+// Install the vectored exception handler when `d3d12_xs.dll` attaches so early
+// title code (such as `clwb` on pre-Ice Lake CPUs) is covered before the first
+// device is created. Using `.CRT$XCU` avoids colliding with `libcmt`'s default
+// `DllMain` stub when linking this staticlib with MSVC `link.exe`.
+#[cfg(not(test))]
+unsafe extern "C" {
+    fn atexit(func: extern "C" fn()) -> i32;
+}
+
+#[cfg(not(test))]
+extern "C" fn uninstall_on_detach() {
+    survey::uninstall_handler();
+}
+
+#[cfg(not(test))]
+extern "C" fn install_on_attach() {
+    if survey::install_handler() {
+        // SAFETY: `atexit` registers a per-DLL detach callback in the MSVC CRT.
+        unsafe { atexit(uninstall_on_detach) };
+    }
+}
+
+#[cfg(not(test))]
+#[used]
+#[unsafe(link_section = ".CRT$XCU")]
+static INSTALL_VEH_INIT: extern "C" fn() = install_on_attach;

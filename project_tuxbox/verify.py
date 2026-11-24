@@ -482,10 +482,19 @@ def verify(host, output, adapter, selected=None, samples=1):
     if present_display:
         report["present_display"] = present_display
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=output.parent, delete=False) as tmp:
-        json.dump(report, tmp, indent=2)
-        tmp.write("\n")
-    Path(tmp.name).replace(output)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=output.parent, delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+            json.dump(report, tmp, indent=2)
+            tmp.write("\n")
+        tmp_path.replace(output)
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
     return int(any(not row["passed"] for row in cases))
 
 

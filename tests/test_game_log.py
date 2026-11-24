@@ -1,4 +1,5 @@
 import io
+import os
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -108,3 +109,21 @@ while not pathlib.Path(sys.argv[1]).exists() and time.monotonic() < end:
                     run.result(timeout=4)
             finally:
                 gate.touch()
+
+    def test_game_log_closes_fd_and_unlinks_on_fdopen_error(self):
+        closed = []
+        real_close = os.close
+
+        def track_close(fd):
+            closed.append(fd)
+            real_close(fd)
+
+        with TemporaryDirectory() as tmp, \
+             patch("project_tuxbox.game_log.log_directory", return_value=Path(tmp)), \
+             patch("os.fdopen", side_effect=OSError("fdopen failed")), \
+             patch("os.close", side_effect=track_close):
+            with self.assertRaises(OSError):
+                with game_log(Path("game.exe")):
+                    pass
+        self.assertTrue(len(closed) > 0)
+        self.assertEqual(list(Path(tmp).glob("*.log")), [])

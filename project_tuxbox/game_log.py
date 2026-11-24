@@ -23,7 +23,16 @@ def game_log(executable, path=None):
         directory.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
         fd, name = tempfile.mkstemp(dir=directory, prefix=f"{executable.stem}-{stamp}-", suffix=".log")
-        path, stream = Path(name), os.fdopen(fd, "wb")
+        try:
+            stream = os.fdopen(fd, "wb")
+        except BaseException:
+            os.close(fd)
+            try:
+                os.unlink(name)
+            except OSError:
+                pass
+            raise
+        path = Path(name)
     else:
         path = path.expanduser().resolve()
         if path == executable.resolve() or (path.exists() and executable.exists() and path.samefile(executable)):
