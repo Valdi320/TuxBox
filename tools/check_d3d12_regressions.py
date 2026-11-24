@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Run a fixed set of synthetic provider regression controls offline.
+
+The supplied build artifacts must come from the intended revision. The
+source Proton prefix is copied and never modified. Logs remain local.
+"""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import re
+import shutil
+import subprocess
+from tempfile import TemporaryDirectory
+from time import monotonic
+
+CASES = {
+    "tables": ("d3d12-tables", (), "d3d12-tables", ("words=16/16", "placed-srv=16/16")),
+    "heaps": ("d3d12-heaps", (), "d3d12-heaps", ("words=256/256", "volume=45/45")),
+    "placement": ("d3d12-placement", (), "d3d12-placement", ("R8-texels=262144", "rejected=3")),
+    "stream": ("d3d12-draw", ("--stream",), "d3d12-stream", ("slot=86", "rejected=4")),
+    "mesh": ("d3d12-mesh", (), "d3d12-mesh", ("pixels=256/256", "guards=32", "rejected=5")),
+    "frame": ("xbox-frame", (), "xbox-frame", ("pixels=962/962",)),
+    "indirect": ("d3d12-indirect", (), "d3d12-indirect", ("list=59", "words=64/64")),
+    "indirect-scarlett": ("d3d12-indirect", ("--scarlett",), "d3d12-indirect", ("list=61", "words=64/64")),
+    "null-usage": ("d3d12-null-usage", (), "d3d12-null-usage", ("words=64/64", "recorded=64", "valid=2")),
+}
+DEFAULT = tuple(name for name in CASES if name not in ("indirect-scarlett", "mesh"))
+DIGEST = hashlib.sha256(bytes.fromhex("78563412efcdab90")).hexdigest()
+
+
+def sha(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def validate(case, adapter, status, output):
+    _, _, name, markers = CASES[case]
+    prefix = f"{name} PASS pci={adapter.lower()} "
+    passes = [line for line in output.splitlines() if line.lower().startswith(prefix.lower())]
+    if status or len(passes) != 1 or any(marker not in passes[0].split() for marker in markers):
+        return False, None
+    if case == "null-usage":
+        # Driver output may interleave; only accept complete exact records.
+        summaries = [line.split("TuxBox d3d12_xs: ",1)[1] for line in output.splitlines()
+                     if line.startswith("TuxBox d3d12_xs: null usage interval ")]
+        ranks = [line.split("TuxBox d3d12_xs: ",1)[1] for line in output.splitlines()
+                 if line.startswith("TuxBox d3d12_xs: null usage rank ")]
+        expected = []
+        expected_ranks = []
+        for interval,count in ((1,1),(2,63)):
+            expected.append(f"null usage interval recorded={count} display_bound=0 tracked=1 overflow=0 overflow_display_bound=0 compute={count} raster=0 interval={interval} trigger=recording_checkpoint")
+            expected_ranks.append(f"null usage rank kind=compute CS={DIGEST} recorded={count} display_bound=0 interval={interval} trigger=recording_checkpoint")
+        if sorted(summaries)!=sorted(expected) or sorted(ranks)!=sorted(expected_ranks):
+            return False, passes[0]
+    return True, passes[0]
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__)
+    for arg in ("build-dir","proton","prefix","compiler-dir","work","output"):
+        ap.add_argument("--"+arg,type=Path,required=True)
+    ap.add_argument("--adapter",required=True)
+    ap.add_argument("--case",choices=tuple(CASES),action="append")
+    a=ap.parse_args(argv)
+    if not re.fullmatch(r"[a-fA-F0-9]{4}:[a-fA-F0-9]{4}",a.adapter):
+        ap.error("adapter must be a PCI vendor:device ID")
+    selected=a.case or DEFAULT
+    if len(set(selected))!=len(selected) or a.output.exists() or a.work.exists():
+        ap.error("unique cases and fresh work/output required")
+    a.work=a.work.resolve()
+    a.prefix=a.prefix.resolve()
+    if not a.prefix.is_dir() or a.work.is_relative_to(a.prefix) or a.output.resolve().is_relative_to(a.prefix):
+        ap.error("work/output must be outside the source prefix")
+    for n in ("bwrap","xvfb-run","timeout"):
+        if not shutil.which(n):
+            ap.error(f"missing host tool: {n}")
+    files=a.proton.resolve()/"files"
+    wine=files/"bin/wine"
+    libs=files/"lib/wine"
+    artifacts={"d3d12_xs.dll":a.build_dir/"d3d12_xs.dll",
+               "d3d12.dll":libs/"vkd3d-proton/x86_64-windows/d3d12.dll",
+               "d3d12core.dll":libs/"vkd3d-proton/x86_64-windows/d3d12core.dll",
+               "dxgi.dll":libs/"dxvk/x86_64-windows/dxgi.dll",
+               "dxcompiler.dll":a.compiler_dir/"dxcompiler.dll",
+               "dxil.dll":a.compiler_dir/"dxil.dll"}
+    artifacts.update({CASES[c][0]+".exe":a.build_dir/(CASES[c][0]+".exe") for c in selected})
+    if any(not p.is_file() for p in (*artifacts.values(),wine)):
+        ap.error("missing build, Proton or compiler artifact")
+    fingerprints={k:sha(p) for k,p in artifacts.items()}
+    a.work.mkdir(parents=True)
+    rows=[]
+    for case in selected:
+        start=monotonic()
+        name,extra,_,_=CASES[case]
+        with TemporaryDirectory(dir=a.work,prefix=case+"-") as temp:
+            trial=Path(temp)
+            for k,source in artifacts.items():
+                if k.endswith(".dll") or k==name+".exe":
+                    shutil.copyfile(source,trial/k)
+                    if sha(trial/k)!=fingerprints[k]:
+                        raise ValueError("artifact changed during staging")
+            subprocess.run(["cp","-a","--reflink=auto",str(a.prefix),str(trial/"prefix")],check=True,timeout=90)
+            for k in ("tmp","runtime","cache"):
+                (trial/k).mkdir(mode=0o700)
+            env={"WINEPREFIX":trial/"prefix","WINESERVER":files/"bin/wineserver",
+                 "WINEDEBUG":"-all","VKD3D_DEBUG":"warn","WINEDLLOVERRIDES":"d3d12,d3d12core,dxgi=n,b",
+                 "XDG_CACHE_HOME":trial/"cache","XDG_RUNTIME_DIR":trial/"runtime","TMPDIR":trial/"tmp",
+                 "VKD3D_SHADER_CACHE_PATH":trial,"TUXBOX_LOG":"stderr","TUXBOX_TRACE_PRESENT":"1"}
+            cmd=["bwrap","--die-with-parent","--unshare-pid","--unshare-net","--ro-bind","/","/",
+                 "--dev-bind","/dev","/dev","--proc","/proc","--tmpfs","/tmp","--bind",str(trial),str(trial),
+                 "--unsetenv","WAYLAND_DISPLAY","--chdir",str(trial)]
+            for k,v in env.items():
+                cmd.extend(("--setenv",k,str(v)))
+            cmd+=["--","xvfb-run","-a","timeout","-k","2s","45s",str(wine),str(trial/(name+".exe")),
+                  *extra,"--adapter",a.adapter]
+            log=a.work/(case+".log")
+            with log.open("xb") as stream:
+                try:
+                    q=subprocess.run(cmd,stdout=stream,stderr=subprocess.STDOUT,timeout=55)
+                    status=q.returncode
+                except subprocess.TimeoutExpired:
+                    status=124
+            # Logs are local only; the JSON receipt contains a fixed case
+            # name, exit status and the known fixture's synthetic PASS line.
+            ok,receipt=validate(case,a.adapter,status,log.read_text(errors="replace"))
+            rows.append(dict(case=case,passed=ok,exit=status,seconds=round(monotonic()-start,3),receipt=receipt))
+            print(case,"PASS" if ok else "FAIL",flush=True)
+    unchanged=fingerprints=={k:sha(p) for k,p in artifacts.items()}
+    report=dict(schema=1,scope="Synthetic D3D12 provider controls; not retail execution",
+                adapter=a.adapter.lower(),proton=(a.proton/"version").read_text().strip(),
+                artifacts_sha256=fingerprints,unchanged=unchanged,cases=rows,
+                passed=unchanged and all(row["passed"] for row in rows))
+    a.output.parent.mkdir(parents=True,exist_ok=True)
+    with a.output.open("x") as stream:
+        json.dump(report,stream,indent=2);stream.write("\n")
+    return int(not report["passed"])
+
+
+if __name__=="__main__":
+    raise SystemExit(main())

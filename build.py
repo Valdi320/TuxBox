@@ -294,7 +294,8 @@ def build_target(tools, target, dxc, d3d12_reference=None):
             subprocess.run([dxc, "-T", profile, "-E", entry, "-O3", *payload, "-Fh", f"{header}.h",
                             "-Vn", variable, str(src / f"{shader}.hlsl")], cwd=out, check=True)
         for name, source in (("tables", "table_guest.cpp"), ("indirect", "indirect_guest.cpp"),
-                             ("draw", "graphics_guest.cpp"), ("mesh", "mesh_guest.cpp")):
+                             ("draw", "graphics_guest.cpp"), ("mesh", "mesh_guest.cpp"),
+                             ("null-usage", "null_usage_guest.cpp")):
             obj = tools.compile(src / source, out, "/W4", "/WX", f"/I{out}")
             tools.link(out / f"d3d12-{name}.exe", obj, "d3d12_xs.lib", "dxgi.lib", "kernel32.lib")
         guest = tools.compile(src / "guest.cpp", out, f"/I{out}")
