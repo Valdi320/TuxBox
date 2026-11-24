@@ -31,6 +31,8 @@ mod scalar_bits;
 mod raw_width;
 #[cfg(test)]
 mod wide_atomic_test;
+#[cfg(test)]
+mod cpu_oracle;
 mod fssm_bindings;
 mod micropoly;
 mod mesh;
