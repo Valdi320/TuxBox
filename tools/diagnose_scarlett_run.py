@@ -106,6 +106,8 @@ class Session:
         self.shader_events = Counter()
         self.terminal = None
         self.null_pipeline_lower_bounds = {}
+        self.null_pipeline_first = {}
+        self.null_pipeline_last = {}
         self.cached_skip_lower_bound = 0
         self.compute_failure_hashes = {}
         self.compute_failure_samples = Counter()
@@ -176,6 +178,10 @@ class Session:
             if m := re.match(r"substituted null (compute|raster stream) pipeline for an untranslated shader \(\d+ so far\)", detail):
                 count = int(re.search(r"\d+", m[0])[0])
                 self.null_pipeline_lower_bounds[m[1]] = max(count, self.null_pipeline_lower_bounds.get(m[1], 0))
+                sample = {"line": number, "timestamp": time, "reported_count": count,
+                          "preceding_milestone": self.last_observed_milestone}
+                self.null_pipeline_first.setdefault(m[1], sample)
+                self.null_pipeline_last[m[1]] = sample
             if m := re.match(r"shader cache skipped (\d+) requests with known unsupported translations", detail):
                 self.cached_skip_lower_bound = max(int(m[1]), self.cached_skip_lower_bound)
             if m := re.match(r"slot 86 pipeline stage failure #\d+ (0x[0-9a-fA-F]{8}) linked=(true|false) VS=([0-9a-f]{64})\(([a-z_]+)\) PS=([0-9a-f]{64})\(([a-z_]+)\)", detail):
@@ -270,6 +276,8 @@ class Session:
                 "unique_shader_requests":len(self.shaders),
                 "runtime_counters": {
                     "null_pipeline_reported_lower_bounds": dict(self.null_pipeline_lower_bounds),
+                     "null_pipeline_first_observed": self.null_pipeline_first,
+                     "null_pipeline_last_observed": self.null_pipeline_last,
                     "cached_unsupported_skip_lower_bound": self.cached_skip_lower_bound,
                     "sampled_compute_failures_by_hresult": [
                         {"hresult": code, "log_events": count, "distinct_dxbc_hashes": len(self.compute_failure_hashes[code])}

@@ -176,3 +176,19 @@ class PipelineEvidenceTests(unittest.TestCase):
             [{"link": "unlinked", "hresult": "0x80070057", "vs": "prepared", "ps": "other", "count": 1}])
         for secret in (a, b, "private_state", "PRIVATE"):
             self.assertNotIn(secret, json.dumps(c))
+
+class NullPipelineOrderTests(unittest.TestCase):
+    def test_first_and_last_sample_are_not_counts_or_causal_proof(self):
+        lines = [
+            D3D + "substituted null compute pipeline for an untranslated shader (1 so far)",
+            D3D + "substituted null raster stream pipeline for an untranslated shader (1 so far)",
+            D3D + "substituted null compute pipeline for an untranslated shader (8 so far)",
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp)/"run.log"
+            path.write_text("\n".join(lines))
+            c = analyze(path)["sessions"][0]["runtime_counters"]
+        self.assertEqual(c["null_pipeline_first_observed"]["compute"]["line"], 1)
+        self.assertEqual(c["null_pipeline_last_observed"]["compute"]["line"], 3)
+        self.assertEqual(c["null_pipeline_first_observed"]["raster stream"]["line"], 2)
+        self.assertEqual(c["null_pipeline_reported_lower_bounds"]["compute"],8)
