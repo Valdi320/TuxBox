@@ -1,5 +1,9 @@
 from contextlib import contextmanager
 import unittest
+import os
+import shutil
+import sys
+from types import SimpleNamespace
 from unittest import mock
 
 from pathlib import Path
@@ -7,7 +11,7 @@ import struct
 import tempfile
 
 from project_tuxbox.verify import (
-    lanes_imports, missing_provider_imports, private_x_server, screen_capture_problem, xauthority_entry)
+    headless_display, lanes_imports, missing_provider_imports, private_x_server, screen_capture_problem, xauthority_entry)
 
 
 class PrivateXServerTests(unittest.TestCase):
@@ -76,6 +80,49 @@ class PrivateXServerTests(unittest.TestCase):
                 self.assertEqual(server[2], {})
             probe.assert_not_called()
         self.assertEqual(started, [()])
+
+class HeadlessDisplayTests(unittest.TestCase):
+    def test_existing_session_and_native_backend_are_unchanged(self):
+        for backend, env in (("proton", {"DISPLAY": ":0"}),
+                             ("wine", {"WAYLAND_DISPLAY": "wayland-0"}),
+                             ("native", {})):
+            with self.subTest(backend=backend, env=env), \
+                 mock.patch("project_tuxbox.verify.sys.platform", "linux"), \
+                 mock.patch("project_tuxbox.verify.subprocess.Popen") as launch:
+                host = SimpleNamespace(backend=backend, env=dict(env))
+                with headless_display(host):
+                    self.assertEqual(host.env, env)
+                launch.assert_not_called()
+
+    def test_missing_xvfb_reports_the_actual_requirement(self):
+        host = SimpleNamespace(backend="proton", env={})
+        with mock.patch("project_tuxbox.verify.sys.platform", "linux"), \
+             mock.patch("project_tuxbox.verify.shutil.which", return_value=None):
+            with self.assertRaisesRegex(ValueError, "Headless guest checks need Xvfb"):
+                with headless_display(host):
+                    self.fail("must not start guest checks")
+
+    @unittest.skipUnless(sys.platform == "linux" and shutil.which("Xvfb"), "requires Xvfb")
+    def test_private_cookie_and_environment_cleanup_even_on_error(self):
+        host = SimpleNamespace(backend="proton", env={"XAUTHORITY": "/old"})
+        before = os.environ.copy()
+        with self.assertRaisesRegex(RuntimeError, "guest failed"):
+            with headless_display(host):
+                display = host.env["DISPLAY"]
+                cookie = Path(host.env["XAUTHORITY"])
+                self.assertRegex(display, r"^:[0-9]+$")
+                self.assertEqual(cookie.stat().st_mode & 0o777, 0o600)
+                self.assertIsNone(screen_capture_problem(display=display, xauthority=str(cookie)))
+                if shutil.which("xdpyinfo"):
+                    env = dict(os.environ, DISPLAY=display, XAUTHORITY=str(cookie))
+                    import subprocess
+                    probe = subprocess.run(["xdpyinfo"], env=env, capture_output=True, timeout=5)
+                    self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
+                raise RuntimeError("guest failed")
+        self.assertFalse(cookie.exists())
+        self.assertEqual(host.env, {"XAUTHORITY": "/old"})
+        self.assertEqual(os.environ, before)
+
 
 class ScreenCaptureTests(unittest.TestCase):
     def test_only_an_x_display_on_linux_is_probed(self):

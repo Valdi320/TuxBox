@@ -61,3 +61,7 @@ python tuxbox.py run --offline /path/to/game
 ```
 
 Run `python tuxbox.py inspect /path/to/game` to see the executable TuxBox will launch and what it found in the package’s `.bin` files. For Frosty, its shipping symbols can also turn addresses from the log into function names. [Symbol lookup example](MATRIX_AWAKENS.md#what-carries-over-to-projectscarlett)
+
+### Headless verification on Linux
+
+When the Wine or Proton backend has neither DISPLAY nor WAYLAND_DISPLAY, `verify` starts a temporary, authenticated Xvfb display (install Xvfb using your distribution). It keeps the desktop environment unchanged and tears down the display on exit. This avoids misleading guest timeouts caused by a missing display. It does not substitute for physical GPU verification; GPU receipts still identify the actual adapter.

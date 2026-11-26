@@ -436,7 +436,61 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
                 host.env[name] = value
 
 
+@contextmanager
+def headless_display(host):
+    """Give Linux guest checks an authenticated X server when no session was inherited."""
+    if (sys.platform != "linux" or host.backend not in ("wine", "proton")
+            or host.env.get("DISPLAY") or host.env.get("WAYLAND_DISPLAY")):
+        yield
+        return
+    xvfb = shutil.which("Xvfb")
+    if not xvfb:
+        raise ValueError("Headless guest checks need Xvfb or an accessible graphical session")
+    with tempfile.TemporaryDirectory(prefix="tuxbox-xvfb-") as directory:
+        auth = Path(directory) / "Xauthority"
+        descriptor = os.open(auth, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(xauthority_entry(os.urandom(16)))
+        read, write = os.pipe()
+        try:
+            server = subprocess.Popen([xvfb, "-displayfd", str(write), "-screen", "0",
+                                       "2560x1440x24", "-nolisten", "tcp", "-auth", str(auth)],
+                                      pass_fds=(write,), stdin=subprocess.DEVNULL,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            os.close(read)
+            raise
+        finally:
+            os.close(write)
+        saved = {key: host.env.get(key) for key in ("DISPLAY", "XAUTHORITY")}
+        try:
+            number = os.read(read, 32) if select.select([read], [], [], 10)[0] else b""
+            if not number.strip().isdigit() or server.poll() is not None:
+                raise ValueError("Could not start the private Xvfb display")
+            host.env.update(DISPLAY=f":{int(number)}", XAUTHORITY=str(auth))
+            print(f"verify: private headless Xvfb display {host.env['DISPLAY']}", flush=True)
+            yield
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    host.env.pop(key, None)
+                else:
+                    host.env[key] = value
+            os.close(read)
+            server.terminate()
+            try:
+                server.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                server.kill()
+                server.wait()
+
+
 def verify(host, output, adapter, selected=None, samples=1):
+    with headless_display(host):
+        return _verify(host, output, adapter, selected, samples)
+
+
+def _verify(host, output, adapter, selected=None, samples=1):
     if adapter and not re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{4}", adapter):
         raise ValueError("Adapter must be a PCI vendor:device pair in hexadecimal")
     if not selected:
@@ -699,7 +753,8 @@ def verify(host, output, adapter, selected=None, samples=1):
         if "present" in selected:
             # The desktop's rootless XWayland can't be sampled; present into a private rootful
             # Xwayland instead, and fail fast with the cause if that isn't possible either.
-            capture = screen_capture_problem()
+            capture = screen_capture_problem(display=host.env.get("DISPLAY", ""),
+                                             xauthority=host.env.get("XAUTHORITY"))
             server = private_x_server(work, adapter=adapter) if capture else nullcontext()
             saved = {key: host.env.get(key) for key in ("DISPLAY", "XAUTHORITY", "MESA_VK_WSI_DEBUG")}
             with server as private:
