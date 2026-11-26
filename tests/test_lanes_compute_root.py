@@ -68,7 +68,7 @@ class ComputeRootGateTests(unittest.TestCase):
     STAND_IN = "substituted null compute pipeline for an untranslated shader (1 so far)\n"
     REFUSAL = "unmapped descriptor at s5 + 0xa0"
 
-    def run_gate(self, output, compiled, refused):
+    def run_gate(self, output, compiled, refused, null_policy=None):
         rootless = [hashlib.sha256(shader_fixture.root_shader(offset)).hexdigest() for offset in (0x40, 0xA0)]
         with TemporaryDirectory() as prefix:
             sources = Path(prefix) / SOURCE_CACHE
@@ -80,6 +80,8 @@ class ComputeRootGateTests(unittest.TestCase):
             for path in (*stale, kept):
                 path.write_bytes(b"")
             env = {"WINEPREFIX": prefix, "TUXBOX_SHADER_SESSION": "1", "TUXBOX_LOG": "stderr"}
+            if null_policy is not None:
+                env["TUXBOX_NULL_PIPELINES"] = null_policy
             seen = {}
 
             @contextmanager
@@ -117,6 +119,14 @@ class ComputeRootGateTests(unittest.TestCase):
         self.assertEqual(seen["left"], ["title.cso"])
         self.assertEqual(seen["env_after"]["TUXBOX_SHADER_SESSION"], "1")
         self.assertEqual(seen["env_after"]["TUXBOX_LOG"], "stderr")
+
+    def test_null_policy_is_explicit_and_restored(self):
+        for policy in (None, "0", "1"):
+            with self.subTest(policy=policy):
+                seen, _ = self.run_gate(self.STAND_IN, ["a"*64], [("b"*64, self.REFUSAL)], policy)
+                self.assertEqual(seen["env"]["TUXBOX_NULL_PIPELINES"], "1")
+                self.assertEqual(seen["env_after"].get("TUXBOX_NULL_PIPELINES"), policy)
+                self.assertIsNone(seen["problem"])
 
     def test_rootless_fallback_fails(self):
         rootless = self.run_gate(self.STAND_IN, [], [])[1]
