@@ -190,6 +190,33 @@ pub(super) fn unmap(address: usize) -> Result<(), u32> {
     }
 }
 
+pub(super) fn map_private_range(address: usize, bytes: usize) -> Result<(), u32> {
+    let view = unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            address as _,
+            bytes,
+            MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+            PAGE_READWRITE,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if view.is_null() {
+        Err(unsafe { GetLastError() })
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn unmap_private_range(address: usize, bytes: usize) -> Result<(), u32> {
+    if unsafe { VirtualFree(address as _, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) } == 0 {
+        Err(unsafe { GetLastError() })
+    } else {
+        Ok(())
+    }
+}
+
 pub(super) fn region(address: usize) -> Result<MEMORY_BASIC_INFORMATION, u32> {
     let mut info = MEMORY_BASIC_INFORMATION::default();
     if unsafe {

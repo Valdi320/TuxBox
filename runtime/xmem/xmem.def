@@ -36,6 +36,9 @@ EXPORTS
     XMemTransferMemory @34
     XMemVirtualAlloc @35
     XMemVirtualQuery @36
+    TuxBoxAcquirePhysicalBacking PRIVATE
+    TuxBoxAcquirePhysicalBackingRuns PRIVATE
     TuxBoxCopyPageMappings PRIVATE
+    TuxBoxReleasePhysicalBacking PRIVATE
     TuxBoxValidatePinnedPageMappings PRIVATE
     TuxBoxWritePhysicalPages PRIVATE

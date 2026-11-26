@@ -18,15 +18,20 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 const PAGE: usize = shared_pages::PAGE;
 const FLAGS: u64 = 0x2040_0000;
+mod backing;
 mod copy_mappings;
+mod private_views;
+use backing::{DeferredKind, HoldRecord, PageBacking};
 
 struct Page {
     section: Arc<Section>,
     offset: u64,
     aliases: usize,
+    cpu_views: usize,
     has_section_data: bool,
     mapped: bool,
     saved: Vec<u8>,
+    backing: PageBacking,
 }
 
 #[derive(Default)]
@@ -37,9 +42,15 @@ struct Pool {
     gpu_aliases: HashSet<usize>,
     // Contiguous token batches share one OS view until a partial unmap.
     views: BTreeMap<usize, usize>,
+    // Contiguous private anonymous views for single-CPU-view and GPU-alias pages.
+    private_views: BTreeMap<usize, usize>,
     // Only split apertures with live views are retained. An empty original
     // reservation is coalesced and may be released directly by the guest.
     apertures: BTreeMap<usize, (usize, usize)>,
+    next_hold: u64,
+    holds: HashMap<u64, HoldRecord>,
+    view_holds: HashMap<usize, usize>,
+    deferred_unmaps: HashMap<usize, DeferredKind>,
 }
 
 static POOL: LazyLock<Mutex<Pool>> = LazyLock::new(|| Mutex::new(Pool::default()));
@@ -124,10 +135,12 @@ impl Pool {
                 Page {
                     mapped: false,
                     aliases: 0,
+                    cpu_views: 0,
                     saved: Vec::new(),
                     offset: (token - first) * PAGE as u64,
                     section: Arc::clone(&section),
                     has_section_data: false,
+                    backing: PageBacking::Unbacked,
                 },
             );
         }
@@ -205,6 +218,8 @@ impl Pool {
         }
         page.has_section_data = true;
         page.aliases += 1;
+        page.cpu_views += 1;
+        page.backing = PageBacking::SharedSection;
         self.mappings.insert(at, token);
         self.apertures.entry(base).or_insert((extent, 0)).1 += 1;
         Ok(true)
@@ -238,7 +253,9 @@ impl Pool {
         for (i, &token) in tokens.iter().enumerate() {
             let p = self.pages.get_mut(&token).unwrap();
             p.aliases += 1;
+            p.cpu_views += 1;
             p.has_section_data = true;
+            p.backing = PageBacking::SharedSection;
             self.mappings.insert(start + i * PAGE, token);
         }
         Ok(true)
@@ -251,6 +268,13 @@ impl Pool {
         let end = at + bytes;
         if at >= hi || end > hi { return Ok(false); }
         let (base, extent) = self.aperture(at).ok_or(ERROR_INVALID_ADDRESS)?;
+        if self.has_hold(lo, hi) {
+            for va in (at..end).step_by(PAGE) {
+                self.clear_page_mapping(va, false);
+                self.deferred_unmaps.insert(va, DeferredKind::SectionPlaceholder);
+            }
+            return Ok(true);
+        }
         let first = &self.pages[&self.mappings[&lo]];
         let section = first.section.clone();
         let offset = first.offset;
@@ -263,9 +287,6 @@ impl Pool {
                 section.map_range(offset + (a - lo) as u64, a, b - a)?;
                 restored.push((a, b));
             }
-            if self.apertures[&base].1 == bytes / PAGE {
-                shared_pages::coalesce(base, extent)?;
-            }
             Ok(())
         })();
         if let Err(e) = resize {
@@ -277,12 +298,9 @@ impl Pool {
         self.views.remove(&lo);
         self.views.extend(restored);
         for a in (at..end).step_by(PAGE) {
-            let t = self.mappings.remove(&a).unwrap();
-            self.pages.get_mut(&t).unwrap().aliases -= 1;
+            self.clear_page_mapping(a, false);
         }
-        let live = &mut self.apertures.get_mut(&base).unwrap().1;
-        *live -= bytes / PAGE;
-        if *live == 0 { self.apertures.remove(&base); }
+        self.release_aperture_pages(base, extent, bytes / PAGE);
         Ok(true)
     }
 
@@ -290,6 +308,11 @@ impl Pool {
         if self.unmap_view_range(at, PAGE)? { return Ok(()); }
         let (base, extent) = self.aperture(at).ok_or(ERROR_INVALID_ADDRESS)?;
         let token = *self.mappings.get(&at).ok_or(ERROR_INVALID_ADDRESS)?;
+        if self.has_hold(at, at + PAGE) {
+            self.clear_page_mapping(at, false);
+            self.deferred_unmaps.insert(at, DeferredKind::SectionPlaceholder);
+            return Ok(());
+        }
         shared_pages::unmap(at)?;
         if self.apertures[&base].1 == 1 {
             if let Err(error) = shared_pages::coalesce(base, extent) {
@@ -303,9 +326,19 @@ impl Pool {
         } else {
             self.apertures.get_mut(&base).unwrap().1 -= 1;
         }
-        self.pages.get_mut(&token).unwrap().aliases -= 1;
-        self.mappings.remove(&at);
+        self.clear_page_mapping(at, false);
         Ok(())
+    }
+
+    fn map_cpu_page(&mut self, at: usize, token: u64) -> Result<bool, u32> {
+        match self.pages[&token].backing {
+            PageBacking::SharedSection => self.map_shared_page(at, token),
+            PageBacking::PrivateView(_) if self.pages[&token].cpu_views >= 1 => {
+                self.promote_to_section(token)?;
+                self.map_shared_page(at, token)
+            }
+            _ => self.map_private_page(at, token, false),
+        }
     }
 
     fn map(&mut self, address: usize, bytes: usize, tokens: &[u64]) -> Result<(), u32> {
@@ -315,19 +348,29 @@ impl Pool {
         self.mappings
             .try_reserve(tokens.len())
             .map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
-        if self.map_contiguous(address, tokens)? { return Ok(()); }
-        if self.map_shared_page(address, tokens[0])? {
+        if self.map_private_contiguous(address, tokens, false)? { return Ok(()); }
+        if tokens.iter().all(|t| matches!(self.pages[t].backing, PageBacking::SharedSection))
+            && self.map_contiguous(address, tokens)?
+        {
+            return Ok(());
+        }
+        if self.map_cpu_page(address, tokens[0])? {
             let (base, extent) = self.aperture(address).unwrap();
             for (i, &token) in tokens.iter().enumerate().skip(1) {
                 let at = address + i * PAGE;
                 let result = if at - base < extent {
-                    self.map_shared_page(at, token)
+                    self.map_cpu_page(at, token)
                 } else {
                     Err(ERROR_INVALID_ADDRESS)
                 };
                 if !matches!(result, Ok(true)) {
                     for prior in (0..i).rev() {
-                        self.unmap_shared_page(address + prior * PAGE)?;
+                        let prev = address + prior * PAGE;
+                        if self.private_views.range(..=prev).next_back().is_some_and(|(_, &hi)| prev < hi) {
+                            let _ = self.unmap_private_view_range(prev, PAGE, true);
+                        } else {
+                            let _ = self.unmap_shared_page(prev);
+                        }
                     }
                     return Err(result.err().unwrap_or(ERROR_INVALID_ADDRESS));
                 }
@@ -339,6 +382,10 @@ impl Pool {
         let mut cursor = address;
         let mut reservation = ptr::null_mut::<c_void>();
         while cursor < address + bytes {
+            if matches!(self.deferred_unmaps.get(&cursor), Some(DeferredKind::LegacyCommit)) {
+                cursor = cursor.checked_add(PAGE).ok_or(ERROR_INVALID_ADDRESS)?;
+                continue;
+            }
             // SAFETY: VirtualQuery writes only the specified local structure.
             if unsafe {
                 VirtualQuery(
@@ -363,37 +410,53 @@ impl Pool {
         if (0..tokens.len()).any(|i| self.mappings.contains_key(&(address + i * PAGE))) {
             return Err(ERROR_BUSY);
         }
-        // SAFETY: caller owns the reserved range exclusively during this operation.
-        if unsafe { VirtualAlloc(address as _, bytes, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
-            return Err(unsafe { GetLastError() });
+        for i in 0..tokens.len() {
+            let at = address + i * PAGE;
+            if matches!(self.deferred_unmaps.get(&at), Some(DeferredKind::LegacyCommit)) {
+                continue;
+            }
+            // SAFETY: caller owns the reserved range exclusively during this operation.
+            if unsafe { VirtualAlloc(at as _, PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+                let err = unsafe { GetLastError() };
+                for prior in 0..i {
+                    let prev = address + prior * PAGE;
+                    if !matches!(self.deferred_unmaps.get(&prev), Some(DeferredKind::LegacyCommit)) {
+                        unsafe { VirtualFree(prev as _, PAGE, MEM_DECOMMIT); }
+                    }
+                }
+                return Err(err);
+            }
         }
         for (i, &token) in tokens.iter().enumerate() {
-            let p = &self.pages[&token];
-            if p.has_section_data && p.saved.is_empty()
-                && let Err(e) = p.section.read_into(p.offset, (address + i * PAGE) as *mut u8)
-            {
-                unsafe { VirtualFree(address as _, bytes, MEM_DECOMMIT); }
+            let at = address + i * PAGE;
+            let zero = self.deferred_unmaps.contains_key(&at);
+            if let Err(e) = self.populate_page_bytes(token, at as *mut u8, zero) {
+                for j in 0..tokens.len() {
+                    let p = address + j * PAGE;
+                    if !self.deferred_unmaps.contains_key(&p) {
+                        unsafe { VirtualFree(p as _, PAGE, MEM_DECOMMIT); }
+                    }
+                }
                 return Err(e);
             }
         }
         for (i, token) in tokens.iter().enumerate() {
             let at = address + i * PAGE;
+            self.deferred_unmaps.remove(&at);
             let page = self
                 .pages
                 .get_mut(token)
                 .expect("validated under pool lock");
-            if !page.saved.is_empty() {
-                // SAFETY: saved holds one full page and VirtualAlloc committed its destination.
-                unsafe { ptr::copy_nonoverlapping(page.saved.as_ptr(), at as *mut u8, PAGE) };
-                page.saved = Vec::new();
-            }
+            page.saved = Vec::new();
             page.mapped = true;
+            page.backing = PageBacking::PrivateView(at);
             self.mappings.insert(at, *token);
         }
         Ok(())
     }
 
     fn unmap(&mut self, address: usize, bytes: usize) -> Result<(), u32> {
+        if self.unmap_private_view_range(address, bytes, true)? { return Ok(()); }
         if self.unmap_view_range(address, bytes)? { return Ok(()); }
         if let Some((base, extent)) = self.aperture(address) {
             if address + bytes > base + extent {
@@ -404,12 +467,26 @@ impl Pool {
                 .try_reserve_exact(bytes / PAGE)
                 .map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
             for at in (address..address + bytes).step_by(PAGE) {
-                entries.push((at, *self.mappings.get(&at).ok_or(ERROR_INVALID_ADDRESS)?));
+                let was_private = self
+                    .private_views
+                    .range(..=at)
+                    .next_back()
+                    .is_some_and(|(_, &hi)| at < hi);
+                entries.push((at, *self.mappings.get(&at).ok_or(ERROR_INVALID_ADDRESS)?, was_private));
             }
-            for (i, &(at, _)) in entries.iter().enumerate() {
-                if let Err(e) = self.unmap_shared_page(at) {
-                    for &(prior, token) in entries[..i].iter().rev() {
-                        self.map_shared_page(prior, token)?;
+            for (i, &(at, _, was_private)) in entries.iter().enumerate() {
+                let res = if was_private {
+                    self.unmap_private_view_range(at, PAGE, true).map(|_| ())
+                } else {
+                    self.unmap_shared_page(at)
+                };
+                if let Err(e) = res {
+                    for &(prior, token, prior_private) in entries[..i].iter().rev() {
+                        if prior_private {
+                            let _ = self.map_private_page(prior, token, false);
+                        } else {
+                            let _ = self.map_shared_page(prior, token);
+                        }
                     }
                     return Err(e);
                 }
@@ -445,19 +522,24 @@ impl Pool {
                 return Err(unsafe { GetLastError() });
             }
         }
-        // SAFETY: all pages in this aligned range are registered to this provider.
-        if unsafe { VirtualFree(address as _, bytes, MEM_DECOMMIT) } == 0 {
-            return Err(unsafe { GetLastError() });
-        }
         for at in (address..address + bytes).step_by(PAGE) {
+            if self.has_hold(at, at + PAGE) {
+                self.deferred_unmaps.insert(at, DeferredKind::LegacyCommit);
+            } else if unsafe { VirtualFree(at as _, PAGE, MEM_DECOMMIT) } == 0 {
+                return Err(unsafe { GetLastError() });
+            }
             let token = self
                 .mappings
                 .remove(&at)
                 .expect("validated under pool lock");
-            self.pages
+            let page = self
+                .pages
                 .get_mut(&token)
-                .expect("mapping owns a live page")
-                .mapped = false;
+                .expect("mapping owns a live page");
+            page.mapped = false;
+            if matches!(page.backing, PageBacking::PrivateView(v) if v == at) {
+                page.backing = PageBacking::Unbacked;
+            }
         }
         Ok(())
     }
@@ -489,16 +571,18 @@ pub unsafe extern "system" fn write_pages(tokens: *const u64, count: usize, offs
         // A page mapped into a legacy reservation holds its live bytes in that
         // private committed copy, not in its section. Write there, or the next
         // unmap saves the stale copy over this write.
-        let legacy = match pool.pages.get(&token) {
-            Some(page) if page.mapped => pool.mappings.iter().find(|&(_, t)| *t == token).map(|(&at, _)| at),
-            Some(_) => None,
-            None => return failure(ERROR_INVALID_ADDRESS),
+        let Some(page) = pool.pages.get_mut(&token) else {
+            return failure(ERROR_INVALID_ADDRESS);
         };
-        let page = pool.pages.get_mut(&token).expect("checked above");
+        let dst = match &page.backing {
+            PageBacking::PrivateView(at) => Some(*at),
+            PageBacking::PrivateArena { arena, offset } => Some(arena.base() + *offset),
+            PageBacking::SharedSection | PageBacking::Unbacked => None,
+        };
         // SAFETY: `data` has `len` bytes; `chunk` stays inside one page.
         let src = unsafe { data.add(done) };
-        if let Some(at) = legacy {
-            // SAFETY: the legacy mapping committed this page read-write.
+        if let Some(at) = dst {
+            // SAFETY: the live private page/arena is committed read-write.
             unsafe { ptr::copy_nonoverlapping(src, (at + within) as *mut u8, chunk) };
         } else if !page.saved.is_empty() {
             unsafe { ptr::copy_nonoverlapping(src, page.saved.as_mut_ptr().add(within), chunk) };
@@ -606,7 +690,16 @@ pub unsafe extern "system" fn free(count: usize, tokens: *const u64) -> i32 {
         while first < mapped.len() {
             let start = mapped[first].0;
             let mut last = first + 1;
-            let result = if let Some((_, &limit)) = pool.views.range(..=start).next_back()
+            let result = if let Some((_, &limit)) = pool.private_views.range(..=start).next_back()
+                && start < limit
+            {
+                while last < mapped.len() && mapped[last].0 < limit
+                    && mapped[last].0 == mapped[last - 1].0 + PAGE {
+                    last += 1;
+                }
+                pool.unmap_private_view_range(start, (last - first) * PAGE, false)
+                    .and_then(|done| if done { Ok(()) } else { Err(ERROR_INVALID_ADDRESS) })
+            } else if let Some((_, &limit)) = pool.views.range(..=start).next_back()
                 && start < limit
             {
                 while last < mapped.len() && mapped[last].0 < limit
@@ -620,7 +713,7 @@ pub unsafe extern "system" fn free(count: usize, tokens: *const u64) -> i32 {
             };
             if let Err(error) = result {
                 for &(prior, token) in mapped[..first].iter().rev() {
-                    if !matches!(pool.map_shared_page(prior, token), Ok(true)) {
+                    if !matches!(pool.map_cpu_page(prior, token), Ok(true)) {
                         return failure(ERROR_INVALID_ADDRESS);
                     }
                 }
