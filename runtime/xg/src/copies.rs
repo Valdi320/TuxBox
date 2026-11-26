@@ -123,7 +123,13 @@ unsafe fn transfer(
     if (height > 1 && row_pitch < row_bytes) || (depth > 1 && (slice_pitch as u64) < row_end) {
         return E_INVALIDARG;
     }
-    let copy_width = if row_linear { width } else { 1 };
+    let copy_width = if row_linear {
+        width
+    } else if this.dimension == 3 && this.depth_stencil.is_none() && surface.color_samples() == 1 {
+        surface.horizontal_copy_span(mip)
+    } else {
+        1
+    };
     for z in 0..depth {
         for y in 0..height {
             let row_start = z as usize * slice_pitch + y as usize * row_pitch;
@@ -142,7 +148,7 @@ unsafe fn transfer(
                 let Some(offset) = offset else {
                     return E_INVALIDARG;
                 };
-                let count = copy_width as usize * bpe;
+                let count = copy_width.min(width - x) as usize * bpe;
                 if offset + count as u64 > surface.size {
                     return E_INVALIDARG;
                 }

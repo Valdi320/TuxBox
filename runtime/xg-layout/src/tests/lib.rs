@@ -360,3 +360,51 @@ fn single_sample_color_has_no_msaa_tile() {
     assert_eq!(p.color_samples(), 1);
     assert!(p.multisample_tile().is_none());
 }
+
+#[test]
+fn contiguous_spans_preserve_every_element_offset() {
+    assert_eq!(Plane::compute(&desc(61, 64, 64, 1, 1, TILE_4K)).unwrap().horizontal_copy_span(0), 16);
+    assert_eq!(Plane::compute(&desc(28, 64, 64, 1, 1, TILE_4K)).unwrap().horizontal_copy_span(0), 4);
+    let mut surfaces = planes();
+    for &(format, _) in &FORMATS {
+        for layout in [257, 258, 265, 266, 273, 274] {
+            let d = desc(format, 301, 131, 2, 1, layout);
+            let result = if layout <= 258 { Plane::compute_microtile(&d) }
+                         else { Plane::compute_sparse_64k(&d) };
+            if let Ok(p) = result { surfaces.push((d, p)); }
+        }
+        let d = Desc { flags: 1, ..desc(format, 301, 131, 2, 4, 0) };
+        if let Ok(p) = Plane::compute_64k_mips(&d) { surfaces.push((d, p)); }
+    }
+    let mut comparisons = 0u64;
+    let mut grouped = 0u64;
+    for (d, p) in surfaces {
+        for level in 0..p.mip_count() {
+            let (width, height, _, _) = p.mip_extent(level).unwrap();
+            let span = p.horizontal_copy_span(level);
+            assert!(span > 0);
+            let eb = u64::from(p.element_bytes());
+            for v4 in [false, true] {
+                for layer in [0, u32::from(d.slices) - 1] {
+                    for y in 0..height.min(140) {
+                        for x in (0..width.min(310)).step_by(span as usize) {
+                            let count = span.min(width - x);
+                            let start = p.element_offset_for_hardware(layer, level, x.into(), y, v4).unwrap();
+                            for i in 0..count {
+                                let actual = p.element_offset_for_hardware(layer, level, (x + i).into(), y, v4);
+                                assert_eq!(actual, Some(start + u64::from(i) * eb),
+                                           "format {} layout {} level {level} v4 {v4} layer {layer} x {x} y {y}", d.format, d.layout);
+                                comparisons += 1;
+                            }
+                            if count > 1 { grouped += 1; }
+                            assert!(start + u64::from(count) * eb <= p.size);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(comparisons > 1_000_000);
+    assert!(grouped > 10_000);
+    println!("compared {comparisons} elements across {grouped} contiguous spans");
+}

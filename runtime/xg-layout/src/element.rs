@@ -2,6 +2,34 @@
 use super::*;
 
 impl Plane {
+    /// Number of horizontally adjacent storage elements that are guaranteed
+    /// contiguous when X starts at a multiple of this span. Callers must
+    /// clamp the final span to the logical row width. Only for 2D
+    /// single-sample color data; unknown modes and packed tails use one.
+    pub fn horizontal_copy_span(&self, level: u32) -> u32 {
+        if level >= self.mip_count() || self.color_samples() != 1 {
+            return 1;
+        }
+        let mip = &self.mips[level as usize];
+        if mip.swizzle == 0 {
+            return mip.width_elements.max(1);
+        }
+        if level >= self.unpacked_mips || !matches!(self.element_bytes, 1 | 2 | 4 | 8 | 16) {
+            return 1;
+        }
+        // The low X-coordinate bits in the address equations below
+        // occupy consecutive byte bits starting at log2(element_bytes).
+        // The 64 KiB bank XORs only affect higher bits.
+        let standard = 16 / self.element_bytes;
+        match (mip.swizzle, self.alignment, self.element_bytes) {
+            (1, 256, _) | (5, 4096, _) | (9 | 17, 65536, _) => standard,
+            (2, 256, 1) | (10 | 18, 65536, 1) => 8,
+            (2, 256, 16) | (10 | 18, 65536, 16) | (27, 65536, 16) => 2,
+            (2, 256, _) | (10 | 18 | 27, 65536, _) => standard,
+            _ => 1,
+        }
+    }
+
     /// Native linear address-to-coordinate queries scan physical mip ranges
     /// first, then decode the slice in increasing level order.
     pub fn linear_coordinate(&self, offset: u64) -> Option<(u32, u64, u32, u32)> {
