@@ -460,9 +460,11 @@ def lanes_compute_root(host, check, gpu_args, pci, memory_symbols):
             return "the provider substituted a stand-in for the program its root can bind"
         return None
 
-    names = ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_SHADER_SESSION")
+    # This gate deliberately checks one refused program's stand-in. Do not
+    # inherit the caller's policy for the real game or another verification gate.
+    names = ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_SHADER_SESSION", "TUXBOX_NULL_PIPELINES")
     saved = {name: host.env.get(name) for name in names}
-    host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr")
+    host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr", TUXBOX_NULL_PIPELINES="1")
     host.env.pop("TUXBOX_SHADER_SESSION", None)
     try:
         forget(rootless)
