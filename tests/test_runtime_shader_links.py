@@ -417,7 +417,7 @@ class RuntimeShaderLinks(unittest.TestCase):
         store.key.return_value = "c" * 64
         store.root = self.cache / "content"
         store.root.mkdir()
-        store.fetch.return_value = False
+        store.fetch.return_value = None
         store.is_slow.return_value = True
 
         def run(args, *, timeout):

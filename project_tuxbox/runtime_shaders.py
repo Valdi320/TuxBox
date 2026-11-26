@@ -19,10 +19,10 @@ from .inspect import digest
 from .persistent_dxc import PersistentDxc
 from .shader_diagnostics import refusal_line
 from .shader_profile import ShaderProfile, timed, count_reuse, DeferredShader
+from .shader_blob import MAX_SHADER_BYTES, bounded_shader, exact_marker
 from .shader_prep import SOURCE_CACHE, ToolFailure, compiler_tools, run_tool
 
 
-MAX_SHADER_BYTES = 64 << 20
 XSHADER_UNSUPPORTED_HLSL = 65
 # The emitter's one-line refusal reason kept beside an .unsupported marker.
 REASON_BYTES = 512
@@ -45,21 +45,6 @@ class ShaderRefused(ValueError):
     @property
     def reason_known(self):
         return not self.cached or self.remembered
-
-
-def bounded_shader(path):
-    """Snapshot a regular file without following links or blocking on FIFOs."""
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
-    with os.fdopen(os.open(path, flags), "rb") as stream:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode):
-            raise ValueError(f"{path.name} is not a regular shader file")
-        if info.st_size > MAX_SHADER_BYTES:
-            raise ValueError("shader exceeds the 64 MiB runtime limit")
-        data = stream.read(MAX_SHADER_BYTES + 1)
-    if len(data) > MAX_SHADER_BYTES:
-        raise ValueError("shader exceeds the 64 MiB runtime limit")
-    return data
 
 
 def verified_input(path, expected):
@@ -115,18 +100,6 @@ def container_stage(data, *, portable):
 
 def portable_stage(data):
     return container_stage(data, portable=True)
-
-
-def exact_marker(path, expected):
-    """Read a tiny regular marker, without following links or blocking."""
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        with os.fdopen(os.open(path, flags), "rb") as stream:
-            info = os.fstat(stream.fileno())
-            return (stat.S_ISREG(info.st_mode) and info.st_size == len(expected)
-                    and stream.read(len(expected) + 1) == expected)
-    except OSError:
-        return False
 
 
 def remembered_reason(path):
@@ -406,7 +379,7 @@ def _compile_request(source, key, tools, cache, session, *, remember=None, persi
             store = DxilStore.for_cache(cache)
             content = store.key(hlsl.read_bytes(), target) if store else None
             def reuse_content():
-                data = bounded_shader(output) if store and timed("content_cache_lookup", store.fetch, content, output) else None
+                data = timed("content_cache_lookup", store.fetch, content, output) if store else None
                 if data is not None and portable_stage(data) == target_stage:
                     count_reuse("content")
                     return data
@@ -439,7 +412,7 @@ def _compile_request(source, key, tools, cache, session, *, remember=None, persi
                         if data is None:
                             data = compile_dxil(dxc, dxv, target, hlsl, output, store, key, target_stage)
                         if store:
-                            timed("content_cache_publish", store.save, content, output)
+                            timed("content_cache_publish", store.save, content, data)
             stamp = work / "sha256"
             stamp.write_text(hashlib.sha256(data).hexdigest())
             if session is not None:

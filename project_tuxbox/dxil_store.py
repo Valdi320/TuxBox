@@ -10,11 +10,11 @@ import hashlib
 import os
 from pathlib import Path
 import re
-import shutil
 from tempfile import mkstemp
 
 from .inspect import digest
 from .shader_prep import has_dxil_container
+from .shader_blob import MAX_SHADER_BYTES, bounded_shader, exact_marker, bounded_regular
 
 
 # Bump when a policy change can make cached DXIL unacceptable under validation.
@@ -64,38 +64,42 @@ class DxilStore:
     def for_cache(cls, cache):
         """The store behind `cache`, or None when reuse is not enabled for it."""
         try:
-            identity = (cache / IDENTITY_FILE).read_text(encoding="ascii")
+            identity = bounded_regular(cache / IDENTITY_FILE, 64).decode("ascii")
             if not re.fullmatch(r"[a-f0-9]{64}", identity):
                 return None
             # <cache root>/runtime/<translator fingerprint> -> <cache root>/dxil/<toolchain>
             root = cache.parent.parent / "dxil" / identity
             root.mkdir(parents=True, exist_ok=True)
-        except (OSError, UnicodeError):
+        except (OSError, UnicodeError, ValueError):
             return None
         return cls(root)
 
     @staticmethod
     def key(hlsl, target):
         tag = f"{target} {VARIANTS[target]}" if target in VARIANTS else target
-        return hashlib.sha256(f"{tag}\n".encode("ascii") + hlsl).hexdigest()
+        digest = hashlib.sha256(f"{tag}\n".encode("ascii"))
+        digest.update(hlsl)
+        return digest.hexdigest()
 
     def fetch(self, key, output):
-        """Copy the stored DXIL to `output` if its bytes still match their stamp."""
+        """Return and stage one bounded, verified snapshot of stored DXIL."""
         try:
-            expected = (self.root / f"{key}.sha256").read_text(encoding="ascii")
-            shutil.copyfile(self.root / f"{key}.cso", output)
-            if digest(output) == expected and has_dxil_container(output.read_bytes()):
+            data = bounded_shader(self.root / f"{key}.cso")
+            checksum = hashlib.sha256(data).hexdigest().encode("ascii")
+            if exact_marker(self.root / f"{key}.sha256", checksum) and has_dxil_container(data):
+                output.write_bytes(data)
                 reused["dxil"] += 1
-                return True
-        except (OSError, UnicodeError):
+                return data
+        except (OSError, ValueError):
             pass
         output.unlink(missing_ok=True)
-        return False
+        return None
 
-    def save(self, key, output):
-        """Keep validated DXIL. A failure only costs a later recompile."""
+    def save(self, key, data):
+        """Keep already-validated DXIL bytes. Failure only costs a later compile."""
+        if len(data) > MAX_SHADER_BYTES:
+            return
         try:
-            data = output.read_bytes()
             _publish(self.root / f"{key}.cso", data)
             _publish(self.root / f"{key}.sha256", hashlib.sha256(data).hexdigest().encode("ascii"))
         except OSError:

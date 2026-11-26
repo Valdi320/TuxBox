@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import os
 from threading import Barrier, Lock
 from pathlib import Path
 import struct
@@ -287,6 +288,56 @@ class DxilReuse(unittest.TestCase):
         self.assertEqual(len(self.calls), 2)
         self.compile(self.cache("c"))
         self.assertEqual(len(self.calls), 2, "the recompile replaced the damaged entry")
+
+    def test_fetch_returns_the_verified_snapshot(self):
+        cache = self.cache("a")
+        data = self.compile(cache)
+        store = DxilStore.for_cache(cache)
+        key = store.key(self.hlsl.encode(), self.profile)
+        output = self.root / "output.cso"
+        self.assertEqual(store.fetch(key, output), data)
+        self.assertEqual(output.read_bytes(), data)
+
+    def test_fetch_rejects_oversized_entries_before_copy(self):
+        store = DxilStore.for_cache(self.cache("a"))
+        key = "a" * 64
+        output = self.root / "output.cso"
+        with (store.root / f"{key}.cso").open("wb") as stream:
+            stream.truncate((64 << 20) + 1)
+        (store.root / f"{key}.sha256").write_text("0" * 64)
+        self.assertIsNone(store.fetch(key, output))
+        self.assertFalse(output.exists())
+
+    def test_fetch_rejects_linked_payloads_and_markers(self):
+        store = DxilStore.for_cache(self.cache("a"))
+        key = "a" * 64
+        output = self.root / "output.cso"
+        data = container(b"void")
+        payload = self.root / "payload"
+        marker = self.root / "marker"
+        payload.write_bytes(data)
+        marker.write_text(hashlib.sha256(data).hexdigest())
+        (store.root / f"{key}.cso").symlink_to(payload)
+        (store.root / f"{key}.sha256").write_bytes(marker.read_bytes())
+        self.assertIsNone(store.fetch(key, output))
+        (store.root / f"{key}.cso").unlink()
+        (store.root / f"{key}.cso").write_bytes(data)
+        (store.root / f"{key}.sha256").unlink()
+        (store.root / f"{key}.sha256").symlink_to(marker)
+        self.assertIsNone(store.fetch(key, output))
+        self.assertFalse(output.exists())
+
+    def test_fifo_payload_and_identity_are_rejected_without_blocking(self):
+        cache = self.cache("a")
+        store = DxilStore.for_cache(cache)
+        key = "a" * 64
+        output = self.root / "output.cso"
+        os.mkfifo(store.root / f"{key}.cso")
+        (store.root / f"{key}.sha256").write_text("0" * 64)
+        self.assertIsNone(store.fetch(key, output))
+        (cache / "dxil-identity").unlink()
+        os.mkfifo(cache / "dxil-identity")
+        self.assertIsNone(DxilStore.for_cache(cache))
 
     def test_timed_out_request_goes_straight_to_o0_afterwards(self):
         self.timeouts = 1
