@@ -72,6 +72,7 @@ CHECKS = {
        for layout in ("linear", "2d", "3d")},
     "pixel-heap-offsets": Check("check_pixel_heap_offsets", emitter="pixel_heap_offsets", dxc=True),
     "straight-pixel-quads": Check("check_straight_pixel_quads", emitter="straight_pixel_quads", dxc=True),
+    "translated-mesh": Check("check_translated_mesh_gpu", emitter="xshader", llvm=True, dxc=True),
     "pixel-link": Check("check_portable_pixel_link", emitter="xshader", dxc=True),
     "pixel-link-slot86": Check("check_slot86_portable_link", emitter="xshader", dxc=True),
     "raw-index": Check("check_raw_index",
