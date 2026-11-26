@@ -15,26 +15,37 @@ fn a_directory_is_listed_once_and_extended() {
 }
 
 #[test]
-fn a_quick_reply_is_not_held_for_a_whole_pause() {
-    let mut pauses = Vec::new();
-    let mut looks = 0;
-    let reply = await_reply(Duration::from_secs(90), |pause| pauses.push(pause), || {
-        looks += 1;
-        (looks == 3).then_some("reply")
-    });
-    assert_eq!(reply, Some("reply"));
-    assert_eq!(pauses, [1, 2].map(Duration::from_millis));
+fn a_pause_stays_a_fraction_of_the_time_already_waited() {
+    let ms = Duration::from_millis;
+    assert_eq!(pause_after(Duration::ZERO), ms(1));
+    assert_eq!(pause_after(ms(16)), ms(2));
+    assert_eq!(pause_after(ms(40)), ms(5));
+    assert_eq!(pause_after(ms(200)), ms(25));
+    assert_eq!(pause_after(Duration::from_secs(60)), ms(25));
 }
 
 #[test]
-fn a_slow_reply_settles_at_the_slowest_pause() {
-    let mut pauses = Vec::new();
+fn a_reply_is_looked_for_once_the_host_removes_the_request() {
+    let dir = std::env::temp_dir().join(format!("tuxbox-reply-due-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let request = dir.join("request.dxbc");
+    fs::write(&request, b"x").unwrap();
+    assert!(!reply_is_due(&request, Duration::ZERO));
+    assert!(reply_is_due(&request, UNPROMPTED_LOOK));
+    fs::remove_file(&request).unwrap();
+    assert!(reply_is_due(&request, Duration::ZERO));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_reply_ends_the_wait() {
+    let mut pauses = 0;
     let mut looks = 0;
-    await_reply(Duration::from_secs(90), |pause| pauses.push(pause), || {
+    let reply = await_reply(Duration::from_secs(90), |_| pauses += 1, || {
         looks += 1;
-        (looks == 9).then_some(())
+        (looks == 3).then_some("reply")
     });
-    assert_eq!(pauses, [1, 2, 4, 8, 16, 25, 25, 25].map(Duration::from_millis));
+    assert_eq!((reply, looks, pauses), (Some("reply"), 3, 2));
 }
 
 #[test]
