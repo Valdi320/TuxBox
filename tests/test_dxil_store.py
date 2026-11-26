@@ -82,6 +82,10 @@ class DxilReuse(unittest.TestCase):
         self.assertEqual(self.compile(self.cache("a"), profile=first),
                          self.compile(self.cache("b"), profile=second))
         self.assertEqual(first.summary()["stages"]["dxc_default"]["calls"], 1)
+        self.assertEqual(first.summary()["stages"]["source_cache_lock"]["calls"], 1)
+        self.assertEqual(first.summary()["stages"]["content_cache_lock"]["calls"], 1)
+        self.assertEqual(second.summary()["stages"]["source_cache_lock"]["calls"], 1)
+        self.assertNotIn("content_cache_lock", second.summary()["stages"])
         self.assertEqual(second.summary()["requests"], {"compiled": 1})
         self.assertEqual(second.summary()["reuse"], {"content": 1})
         self.assertNotIn("dxc_default", second.summary()["stages"])

@@ -1,5 +1,5 @@
 """Compile Xbox shaders and link raster stages requested by a running Proton game."""
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as wait_futures
 import errno
 import hashlib
@@ -146,7 +146,7 @@ def remembered_reason(path):
 
 
 @contextmanager
-def compile_lock(cache, key, timeout=90):
+def compile_lock(cache, key, timeout=90, *, stage="source_cache_lock"):
     """Serialize an exact cold cache key across independent launcher processes.
 
     Keep the lock inode for this compiler fingerprint: unlinking it on
@@ -172,7 +172,7 @@ def compile_lock(cache, key, timeout=90):
                     if monotonic() >= deadline:
                         raise TimeoutError("shader cache lock wait timed out")
                     sleep(min(.025, max(0, deadline - monotonic())))
-        timed("source_cache_lock", acquire)
+        timed(stage, acquire)
         try:
             yield
         finally:
@@ -420,10 +420,10 @@ def _compile_request(source, key, tools, cache, session, *, remember=None, persi
                 # Acquire the shared toolchain/content lock only after a miss.
                 # Always acquire source before content; never the reverse.
                 # Allow time for the optimised attempt, fallback and validation.
-                lock = (compile_lock(store.root, content, timeout=O0_TIMEOUT_MAX + COMPUTE_TIMEOUT + 60)
+                lock = (compile_lock(store.root, content, timeout=O0_TIMEOUT_MAX + COMPUTE_TIMEOUT + 60,
+                                     stage="content_cache_lock")
                         if store else nullcontext())
-                with ExitStack() as stack:
-                    timed("content_cache_lock", stack.enter_context, lock)
+                with lock:
                     data = reuse_content() if store else None
                     if data is None:
                         if (persistent is not None and target == "cs_6_0"

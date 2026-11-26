@@ -9,6 +9,7 @@ needed.
 """
 import argparse
 import json
+import re
 from pathlib import Path
 import struct
 import subprocess
@@ -112,6 +113,48 @@ def instrument(hlsl, width):
     return "RWBuffer<uint> output : register(u0);\n" + hlsl[:end] + stores + "}\n"
 
 
+def paired_instrument(hlsl):
+    """Supply the guest EXEC and two independent values to each host lane."""
+    start = re.search(r"^    s\d+ = gid\.x; s\d+ = gid\.y; s\d+ = gid\.z;\n", hlsl, re.M)
+    if not start or "[WaveSize(32)]" not in hlsl or "[numthreads(32, 1, 1)]" not in hlsl:
+        raise ValueError("unexpected paired Wave64 prologue")
+    load = (
+        "    uint in0 = output[tb_pair], in1 = output[tb_pair + 32u];\n"
+        "    v0__0 = in0 & 0x7fffffffu; v0__1 = in1 & 0x7fffffffu;\n"
+        "    exec_lo = WaveActiveBallot((in0 >> 31u) != 0u).x;\n"
+        "    exec_hi = WaveActiveBallot((in1 >> 31u) != 0u).x;\n"
+    )
+    hlsl = hlsl[:start.end()] + load + hlsl[start.end():]
+    end = hlsl.rstrip().rfind("}")
+    stores = "".join(
+        f"    output[64u + tb_pair + {32*h}u] = v10__{h} | (v11__{h} << 8u) | (WaveGetLaneCount() << 16u);\n"
+        f"    output[128u + tb_pair + {32*h}u] = v12__{h};\n" for h in (0, 1))
+    return "RWBuffer<uint> output : register(u0);\n" + hlsl[:end] + stores + "}\n"
+
+
+def wave64_mode(adapter, info):
+    """Select the native or paired path from the selected Vulkan device."""
+    wanted = tuple(int(part, 16) for part in adapter.split(":"))
+    ranges = set()
+    for block in re.split(r"^GPU\d+:\s*$", info, flags=re.M)[1:]:
+        def value(key):
+            m = re.search(rf"^\s*{key}\s*=\s*(0x[0-9a-fA-F]+|[0-9]+)\s*$", block, re.M)
+            return int(m[1], 0) if m else None
+        if (value("vendorID"), value("deviceID")) != wanted:
+            continue
+        ranges.add((value("minSubgroupSize"), value("maxSubgroupSize")))
+    if len(ranges) != 1:
+        raise ValueError("ambiguous or missing selected Vulkan device")
+    low, high = ranges.pop()
+    if low is None or high is None or not 0 < low <= high:
+        raise ValueError("missing subgroup range")
+    if low <= 64 <= high:
+        return "native"
+    if low <= 32 <= high:
+        return "paired"
+    raise ValueError("device supports neither native Wave64 nor paired Wave32")
+
+
 def inputs(width):
     yield from cases(width)
     yield "below", (1 << width) - 1, list(range(width))
@@ -127,15 +170,15 @@ def seed_for(mask, values):
     return seed
 
 
-def difference(name, seed, mask, values, data):
+def difference(name, seed, mask, values, data, expected_host=None):
     """The first word that is wrong, if any."""
     if len(data) != 4 * len(seed):
         return "no readback"
     actual, expected, width = struct.unpack("<384I", data), list(seed), len(values)
     host = actual[96 + width] >> 16
-    if host != width:
+    if host != (expected_host if expected_host is not None else width):
         return f"host wave of {host}"
-    rows = model(name, [bool((mask >> lane) & 1) for lane in range(width)], values, host)
+    rows = model(name, [bool((mask >> lane) & 1) for lane in range(width)], values, width)
     for lane, (count, rank, last) in enumerate(rows):
         expected[96 + width + lane] = count | rank << 8 | host << 16
         expected[96 + 2 * width + lane] = last
@@ -149,6 +192,12 @@ def main(argv=None):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--adapter", required=True)
     args = parser.parse_args(argv)
+    try:
+        info = subprocess.run(["vulkaninfo"], capture_output=True, text=True, timeout=30, check=True).stdout
+        mode = wave64_mode(args.adapter, info)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        parser.error(f"cannot determine Wave64 test mode: {error}")
+    print(f"Wave64 control: {mode}", flush=True)
     work = args.work.resolve()
     work.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(dir=work) as tmp:
@@ -157,10 +206,12 @@ def main(argv=None):
         for width, bodies in ((32, WAVE32), (64, WAVE64)):
             for name, body in bodies.items():
                 words = words_of(program(body, width), args.llvm_mc, *WAVE_OPTIONS[width])
+                paired = width == 64 and mode == "paired"
                 emitted = subprocess.check_output(
-                    [args.emitter.resolve(), str(width), *(f"{word:08x}" for word in words)], text=True, timeout=30)
+                    [args.emitter.resolve(), *(["--paired"] if paired else []), str(width),
+                     *(f"{word:08x}" for word in words)], text=True, timeout=30)
                 source = trial / f"{name}{width}.hlsl"
-                source.write_text(instrument(emitted, width))
+                source.write_text(paired_instrument(emitted) if paired else instrument(emitted, width))
                 blob = trial / f"{name}{width}.cso"
                 subprocess.run([args.dxc, "-T", "cs_6_6", "-E", "main", "-Fo", blob, source], check=True, timeout=30,
                                capture_output=True)
@@ -178,12 +229,13 @@ def main(argv=None):
         wrong = {}
         for trial_name, (name, seed, mask, values) in trials.items():
             path = trial / f"{trial_name}.bin"
-            found = difference(name, seed, mask, values, path.read_bytes() if path.is_file() else b"")
+            found = difference(name, seed, mask, values, path.read_bytes() if path.is_file() else b"",
+                               32 if mode == "paired" else len(values))
             if found:
                 wrong[trial_name] = found
         passed = status == 0 and fields.get("adapter") == args.adapter and not wrong
         report = dict(passed=passed, scope="Synthetic programs reading lane masks as numbers",
-                      adapter=fields.get("adapter"), guest_exit=status, cases=len(trials),
+                      adapter=fields.get("adapter"), wave64_mode=mode, guest_exit=status, cases=len(trials),
                       compared_words=len(trials) * 384, wrong=wrong, shaders=shaders,
                       emitter_sha256=digest(args.emitter), guest_sha256=digest(exe))
         if fields.get("error"):
