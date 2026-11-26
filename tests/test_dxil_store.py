@@ -233,6 +233,37 @@ class DxilReuse(unittest.TestCase):
             admit.assert_not_called()
         self.assertEqual(len(self.calls), 1)
 
+    def test_profile_counts_deferral_and_reuse_without_false_failure(self):
+        from project_tuxbox.shader_profile import ShaderProfile
+        profile = ShaderProfile()
+        self.hlsl += " " * (256 << 10)
+        data = b"deferred shader"
+        key = hashlib.sha256(data).hexdigest()
+        source = self.root / (key + ".dxbc")
+        source.write_bytes(data)
+        cache = self.cache("a")
+        admit = Mock(side_effect=DeferredShader)
+        with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=self.run_tool):
+            with self.assertRaises(DeferredShader):
+                compile_request(source, key, self.tools, cache, None,
+                                profile=profile, admit_large=admit)
+            self.assertEqual(profile.summary()["requests"], {"deferred": 1})
+            self.assertNotIn("content_cache_lock", profile.summary()["stages"])
+            self.assertFalse(any(cache.glob("*.unsupported")))
+            admit.side_effect = None
+            self.assertTrue(compile_request(source, key, self.tools, cache, None,
+                                            profile=profile, admit_large=admit))
+            admit.reset_mock()
+            admit.side_effect = AssertionError("warm content must bypass admission")
+            self.assertTrue(compile_request(source, key, self.tools, self.cache("b"), None,
+                                            profile=profile, admit_large=admit))
+            admit.assert_not_called()
+        report = profile.summary()
+        self.assertEqual(report["requests"], {"deferred": 1, "compiled": 2})
+        self.assertEqual(report["reuse"], {"content": 1})
+        self.assertEqual(report["stages"]["content_cache_lock"]["calls"], 1)
+        self.assertEqual(report["stages"]["dxc_default"]["calls"], 1)
+
     def test_changed_hlsl_profile_or_toolchain_recompiles(self):
         self.compile(self.cache("a"))
         self.hlsl = "void main() { }"
