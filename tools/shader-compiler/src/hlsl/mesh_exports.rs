@@ -5,6 +5,8 @@ use Opnd::{ConstInt as I, ExecLo, Literal, Scc, Sgpr as S, VccLo, Vgpr as V, M0}
 
 pub(super) struct MeshExports {
     pub start: usize,
+    /// The first instruction after the export sequence's vertex-count guard.
+    pub vertex_start: usize,
     pub lane_index: Opnd,
     pub vertices: Opnd,
     pub primitives: Opnd,
@@ -423,6 +425,7 @@ pub(super) fn recognize(
     }
     seq.write(S(0), "s_and_saveexec_b64", &[S(0)])?;
     let end_vertices = seq.branch("s_cbranch_execz")?;
+    let vertex_start = seq.at;
     let mut vertex_exports = Vec::new();
     let mut targets = 0u64;
     // Registers the program sets for later exports. The emitter reads the values directly.
@@ -514,6 +517,7 @@ pub(super) fn recognize(
     };
     Ok(MeshExports {
         start,
+        vertex_start,
         lane_index,
         vertices,
         primitives,

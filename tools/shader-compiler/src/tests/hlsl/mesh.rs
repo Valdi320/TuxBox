@@ -96,3 +96,203 @@ fn one_count_for_vertices_and_primitives_is_recognized() {
     mixed[5] = 0x88800200;
     assert!(recognize(&mixed).is_err());
 }
+
+const HALF: u32 = 0x7e0e1501; // v_cvt_f16_f32 v7, v1: bits 31:16 keep the launch value
+const LOW: u32 = 0x7e101707; // v_cvt_f32_f16 v8, v7: reads bits 15:0
+const WIDEN: u32 = 0x7e0e1707; // v_cvt_f32_f16 v7, v7: a full write
+const COPY: u32 = 0x7e100307; // v_mov_b32 v8, v7: reads all 32 bits
+const END: u32 = 0xbf810000; // s_endpgm
+const OPEN: u32 = 0xbeac047e; // s_mov_b64 s[44:45], exec
+const GUARD: u32 = 0x7da8002e; // v_cmpx_gt_u32 s46, v0: the vertex count against the lane
+const CLOSE: u32 = 0xbefe042c; // s_mov_b64 exec, s[44:45]
+const SAVE: u32 = 0xbe84047e; // s_mov_b64 s[4:5], exec
+const RESTORE: u32 = 0xbefe0404; // s_mov_b64 exec, s[4:5]
+const NARROW: u32 = 0x7da40280; // v_cmpx_eq_u32 0, v1
+
+fn bytes(words: &[u32]) -> Vec<u8> {
+    words.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+/// `body` in the block the vertex-count guard opens, then `after`.
+fn guarded(body: &[u32], after: &[u32]) -> Vec<u32> {
+    let mut words = vec![OPEN, GUARD, 0xbf880000 | body.len() as u32]; // s_cbranch_execz to CLOSE
+    words.extend(body);
+    words.push(CLOSE);
+    words.extend(after);
+    words.push(END);
+    words
+}
+
+/// Whether v7 keeps only unread launch bits, with the export sequence from word
+/// `start` and its vertex exports from word `vertices`.
+fn kept_from(words: &[u32], start: usize, vertices: usize) -> bool {
+    let insns = disassemble(&bytes(words));
+    let at = |word: usize| insns.iter().position(|op| op.offset == 4 * word).unwrap_or(insns.len());
+    let exports = super::mesh_exports::MeshExports {
+        start: at(start),
+        vertex_start: at(vertices),
+        lane_index: Opnd::Vgpr(0),
+        vertices: Opnd::Sgpr(46),
+        primitives: Opnd::Sgpr(48),
+        connectivity: Opnd::Vgpr(19),
+        guarded_connectivity: Opnd::Vgpr(1),
+        connectivity_without_primitive: Opnd::Sgpr(48),
+        vertex_exports: Vec::new(),
+        primitive_exports: Vec::new(),
+    };
+    kept_half_unread(&insns, 7, &exports)
+}
+
+/// The same, for a program without an export sequence.
+fn kept(words: &[u32]) -> bool {
+    kept_from(words, words.len(), words.len())
+}
+
+#[test]
+fn a_half_result_hides_only_launch_bits_no_reader_takes() {
+    assert!(kept(&guarded(&[HALF, LOW], &[])));
+    assert!(kept(&guarded(&[HALF, WIDEN, COPY], &[])));
+    assert!(kept(&guarded(&[HALF, 0xd7110008, 0x00020307], &[])), "v_pack_b32_f16 v8, v7, v1");
+    assert!(kept(&guarded(&[HALF, 0xe0341000, 0x80000206, LOW], &[])), "a load addressed by v6 alone");
+    assert!(kept(&guarded(&[HALF, 0xd7600007, 0x00010100, LOW], &[])), "v_readlane_b32 writes s7");
+    assert!(!kept(&guarded(&[HALF, COPY], &[])));
+    assert!(!kept(&guarded(&[COPY, HALF, LOW], &[])), "the launch value is read first");
+    assert!(!kept(&guarded(&[HALF, 0xd7110808, 0x00020307], &[])), "op_sel reads the kept high half");
+    assert!(!kept(&guarded(&[HALF, 0x560e0501], &[])), "v_fmac_f32 accumulates into v7");
+    assert!(!kept(&guarded(&[HALF, 0xe0741000, 0x80000600], &[])), "buffer_store_dwordx2 v[6:7]");
+    assert!(!kept(&guarded(&[HALF, 0xe0303000, 0x80000206, LOW], &[])), "an idxen offen address v[6:7]");
+    // A path around the full write, or lanes it skips, still see the launch bits.
+    assert!(!kept(&guarded(&[HALF, 0xbf840001, WIDEN, COPY], &[])), "s_cbranch_scc0 past the full write");
+    assert!(!kept(&guarded(&[HALF, NARROW, WIDEN, COPY], &[])), "v_cmpx_eq_u32 before the full write");
+}
+
+#[test]
+fn a_half_result_is_kept_only_behind_the_vertex_count_guard() {
+    // The recorded shape: the block narrows further and opens another for the
+    // primitive count after it closes.
+    let nested = [HALF, SAVE, NARROW, 0xbf880001, LOW, RESTORE, LOW];
+    let primitives = [0xbe80047e, 0x7da80030, 0xbefe0400]; // s_mov_b64 s[0:1], exec; v_cmpx_gt_u32 s48, v0; s_mov_b64 exec, s[0:1]
+    assert!(kept(&guarded(&nested, &primitives)));
+    // Without the guard, or with one that tests another count or lane, lanes past
+    // the vertex count never execute the 16-bit write.
+    assert!(!kept(&[HALF, LOW, END]));
+    assert!(!kept(&guarded(&[HALF, LOW], &[]).iter().map(|&w| if w == GUARD { 0x7da80030 } else { w }).collect::<Vec<_>>()), "s48 counts primitives");
+    assert!(!kept(&guarded(&[HALF, LOW], &[]).iter().map(|&w| if w == GUARD { 0x7da8022e } else { w }).collect::<Vec<_>>()), "v1 is not the lane");
+    assert!(!kept(&guarded(&[0x812e812e, HALF, LOW], &[])), "s_add_i32 s46, s46, 1 after the guard");
+    assert!(!kept(&guarded(&[HALF, LOW], &[0x7e000301])), "v_mov_b32 v0, v1 after the guard");
+    // (A) A branch from before the 16-bit write to after the full write.
+    assert!(!kept(&[0xbf840002, HALF, WIDEN, COPY, END]), "s_cbranch_scc0 +2 without a guard");
+    assert!(!kept(&guarded(&[0xbf840002, HALF, WIDEN, COPY], &[])), "s_cbranch_scc0 +2 inside the block");
+    // (B) An s_and_saveexec_b64 before the 16-bit write, restored after the full write.
+    let and_saveexec = 0xbe84246a; // s_and_saveexec_b64 s[4:5], vcc
+    assert!(!kept(&[and_saveexec, HALF, WIDEN, RESTORE, COPY, END]));
+    assert!(!kept(&guarded(&[and_saveexec, HALF, WIDEN, RESTORE, COPY], &[])));
+    // (C) The same with v_cmpx.
+    assert!(!kept(&[SAVE, NARROW, HALF, WIDEN, RESTORE, COPY, END]));
+    assert!(!kept(&guarded(&[SAVE, NARROW, HALF, WIDEN, RESTORE, COPY], &[])));
+    // (D) EXEC narrowed around the 16-bit write only, then a low-half read.
+    assert!(!kept(&[SAVE, NARROW, HALF, RESTORE, LOW, END]));
+    assert!(!kept(&guarded(&[SAVE, NARROW, HALF, RESTORE, LOW], &[])));
+    // EXEC widens again inside the block.
+    assert!(!kept(&guarded(&[HALF, CLOSE, LOW], &[])), "the block's own restore, early");
+    assert!(!kept(&guarded(&[HALF, 0xbefe04c1, LOW], &[])), "s_mov_b64 exec, -1");
+    // After the block every lane runs, and lanes past the count hold the launch value.
+    assert!(!kept(&guarded(&[HALF], &[LOW])));
+    // s_branch from after the block back to the copy inside it.
+    assert!(!kept(&guarded(&[HALF, WIDEN, COPY], &[0xbf82fffd])));
+}
+
+#[test]
+fn a_kept_half_reaches_only_the_vertex_exports() {
+    // An export sequence from word 6: a primitive part, then the vertex exports from word 7.
+    let program = |primitive: u32| guarded(&[HALF, WIDEN], &[primitive, 0xf80008cf, 0x33323107]); // exp pos0 v7, v49, v50, v51 done
+    assert!(kept_from(&program(0xbf800000), 6, 7), "s_nop");
+    assert!(!kept_from(&program(COPY), 6, 7), "the primitive exports run lanes past the vertex count");
+}
+
+#[test]
+fn a_guarded_half_result_in_a_recognized_program() {
+    // The guard, the 16-bit write and the full write, then a 128-vertex export
+    // sequence with the vertex count in s46 and the primitive count in s48, as in
+    // the recorded programs. Its position export reads v7.
+    let mut words = vec![OPEN, GUARD, 0xbf880002, HALF, WIDEN, CLOSE];
+    words.extend(separate_count_exports());
+    let check = |words: &[u32]| {
+        let insns = disassemble(&bytes(words));
+        let exports = super::mesh_exports::recognize(&insns, 128, None).unwrap();
+        assert_eq!((exports.vertices, exports.lane_index), (Opnd::Sgpr(46), Opnd::Vgpr(0)));
+        kept_half_unread(&insns, 7, &exports)
+    };
+    assert!(check(&words));
+    let mut primitive_guard = words.clone();
+    primitive_guard[1] = 0x7da80030; // v_cmpx_gt_u32 s48, v0
+    assert!(!check(&primitive_guard));
+}
+
+/// A 128-vertex export sequence with separate counts, assembled with
+/// `llvm-mc -mcpu=gfx1030 -mattr=+wavefrontsize64`.
+fn separate_count_exports() -> Vec<u32> {
+    vec![
+        0xbf06802e, // s_cmp_eq_u32 s46, 0
+        0xb0060080, // s_movk_i32 s6, 0x80
+        0x8580807e, // s_cselect_b64 s[0:1], exec, 0
+        0xbf068030, // s_cmp_eq_u32 s48, 0
+        0x8582807e, // s_cselect_b64 s[2:3], exec, 0
+        0xbf0a2e06, // s_cmp_lt_u32 s6, s46
+        0x8584807e, // s_cselect_b64 s[4:5], exec, 0
+        0xbf0a3006, // s_cmp_lt_u32 s6, s48
+        0x8586807e, // s_cselect_b64 s[6:7], exec, 0
+        0x88800200, // s_or_b64 s[0:1], s[0:1], s[2:3]
+        0x88820604, // s_or_b64 s[2:3], s[4:5], s[6:7]
+        0x88800002, // s_or_b64 s[0:1], s[2:3], s[0:1]
+        0xd5010001, 0x00010280, // v_cndmask_b32_e64 v1, 0, 1, s[0:1]
+        0x7e000501, // v_readfirstlane_b32 s0, v1
+        0x87000081, // s_and_b32 s0, 1, s0
+        0xbf068100, // s_cmp_eq_u32 s0, 1
+        0xbe80047e, // s_mov_b64 s[0:1], exec
+        0x8582807e, // s_cselect_b64 s[2:3], exec, 0
+        0xd5010002, 0x0009022e, // v_cndmask_b32_e64 v2, s46, 1, s[2:3]
+        0xd5010003, 0x00090230, // v_cndmask_b32_e64 v3, s48, 1, s[2:3]
+        0x8984c102, // s_xor_b64 s[4:5], s[2:3], -1
+        0x7e0c0502, // v_readfirstlane_b32 s6, v2
+        0x7e0e0503, // v_readfirstlane_b32 s7, v3
+        0x7da40080, // v_cmpx_eq_u32_e32 0, v0
+        0xbf88000d, // s_cbranch_execz restore
+        0x8f078c07, // s_lshl_b32 s7, s7, 12
+        0x8aea027e, // s_andn2_b64 vcc, exec, s[2:3]
+        0x88060607, // s_or_b32 s6, s7, s6
+        0xbefc0306, // s_mov_b32 m0, s6
+        0xbf900009, // s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)
+        0xbf8c0000, // s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)
+        0xbf870006, // s_cbranch_vccnz restore
+        0xbf8a0000, // s_barrier
+        0x7e027081, // v_bfrev_b32_e32 v1, 1
+        0xf80008c0, 0x00000000, // exp pos0 off, off, off, off done
+        0xf8000941, 0x00000001, // exp prim v1, off, off, off done
+        0xbf8cff0f, // s_waitcnt expcnt(0)
+        0xbefe0400, // s_mov_b64 exec, s[0:1]
+        0xbf8a0000, // s_barrier
+        0x7d880030, // v_cmp_gt_u32_e32 vcc, s48, v0
+        0x8780046a, // s_and_b64 s[0:1], vcc, s[4:5]
+        0xbe862400, // s_and_saveexec_b64 s[6:7], s[0:1]
+        0xbf880012, // s_cbranch_execz vertices
+        0xd5480001, 0x02291513, // v_bfe_u32 v1, v19, 10, 10
+        0xd5480002, 0x02292913, // v_bfe_u32 v2, v19, 20, 10
+        0x363026ff, 0x000003ff, // v_and_b32_e32 v24, 0x3ff, v19
+        0x7d86022e, // v_cmp_le_u32_e32 vcc, s46, v1
+        0xd4c30002, 0x0002042e, // v_cmp_le_u32_e64 s[2:3], s46, v2
+        0xd4c30000, 0x0002302e, // v_cmp_le_u32_e64 s[0:1], s46, v24
+        0x8882026a, // s_or_b64 s[2:3], vcc, s[2:3]
+        0x88800200, // s_or_b64 s[0:1], s[0:1], s[2:3]
+        0xd5010001, 0x0001ff13, 0x80000000, // v_cndmask_b32_e64 v1, v19, 0x80000000, s[0:1]
+        0xf8000941, 0x00000001, // exp prim v1, off, off, off done
+        0xbf8cff0f, // s_waitcnt expcnt(0)
+        0xbefe0406, // s_mov_b64 exec, s[6:7]
+        0x7d88002e, // v_cmp_gt_u32_e32 vcc, s46, v0
+        0x8780046a, // s_and_b64 s[0:1], vcc, s[4:5]
+        0xbe802400, // s_and_saveexec_b64 s[0:1], s[0:1]
+        0xbf880002, // s_cbranch_execz end
+        0xf80008cf, 0x33323107, // exp pos0 v7, v49, v50, v51 done: v7 from the 16-bit block
+        0xbf810000, // s_endpgm
+    ]
+}

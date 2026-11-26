@@ -78,6 +78,8 @@ pub(super) fn translate(
     if has_primitive_attributes != has_attribute_exports {
         return Err("mesh primitive attribute exports do not match PSG1".into());
     }
+    // The export sequence also reads registers.
+    let program = body.clone();
     body.truncate(exports.start);
     if body.iter().any(|op| op.mnemonic == "v_writelane_b32") {
         super::lower_lane_spills(&mut body, false, false)?;
@@ -149,6 +151,10 @@ pub(super) fn translate(
         // User data ends at s39; any later register only holds what the program put there.
         let unset = unset || reg.strip_prefix('s').and_then(|n| n.parse::<u16>().ok()).is_some_and(|n| n >= 40);
         if unset || matches!(reg.as_str(), "s0" | "s3" | "v5") {
+            return false;
+        }
+        // A 16-bit result can keep launch bits that no reader takes.
+        if reg.strip_prefix('v').and_then(|n| n.parse::<u8>().ok()).is_some_and(|n| kept_half_unread(&program, n, &exports)) {
             return false;
         }
         match &bindings {
@@ -425,6 +431,231 @@ fn validate_launch(body: &[Insn], group_shift: i64, lane_index: Opnd) -> Result<
         }
     }
     Err("unrecognized mesh launch group or wave/lane register calculation".into())
+}
+
+/// Whether launch register `v{reg}` is live only through the upper half that a
+/// VOP1 `v_cvt_f16_f32` keeps. RDNA2 16-bit results write bits 15:0 and leave
+/// 31:16, so `live_in` counts the write as a read of the launch value. The
+/// translation starts those bits at zero, which is faithful when no result takes
+/// them. In the recorded programs the register is v6, v7 or v8.
+///
+/// The proof covers the whole program, export sequence included. It follows
+/// `live_in`'s program order: EXEC saves and restores pair up in that order, and
+/// each branch is checked against it.
+/// - The 16-bit write sits in the block the vertex-count guard opens:
+///   `s_mov_b64 s[n:n+1], exec`, then `v_cmpx_gt_u32 count, lane` with the
+///   `count` and `lane` registers the export sequence tests, then
+///   `s_cbranch_execz` to `s_mov_b64 exec, s[n:n+1]`. The guard is the last EXEC
+///   change before the write, and neither register changes after it. Up to the
+///   export sequence EXEC only narrows or returns to a value saved since the
+///   block opened, and inside the block to one saved after the guard. No branch
+///   crosses the guard or the write except the guard's own, taken when no lane is
+///   active. So every lane that reads the register in the block has executed the
+///   write. After the block nothing touches the register before the vertex
+///   exports, which test the same count against the same lane.
+/// - Every later reader takes bits 15:0 only, until a full 32-bit write that no
+///   path leaves early or enters from later code. No register range (loads,
+///   stores, 64-bit and DPP operands) may hold the register without naming it.
+fn kept_half_unread(insns: &[Insn], reg: u8, exports: &mesh_exports::MeshExports) -> bool {
+    let this = Opnd::Vgpr(reg);
+    let half_write = |op: &Insn| {
+        op.mnemonic == "v_cvt_f16_f32" && op.enc == Enc::Vop1 && op.aux.sdwa.is_none() && !op.src.contains(&this)
+    };
+    // VOP3 OPSEL bits 11 and 12 pick the high half of source 0 and 1.
+    let low_half_read = |op: &Insn| {
+        let high = |i: usize| op.enc == Enc::Vop3 && op.raw[0] >> (11 + i) & 1 != 0;
+        op.aux.sdwa.is_none()
+            && matches!(op.enc, Enc::Vop1 | Enc::Vop3)
+            && op.src.iter().enumerate().all(|(i, src)| {
+                *src != this
+                    || match op.mnemonic.as_str() {
+                        "v_cvt_f32_f16" => i == 0 && !high(i),
+                        "v_pack_b32_f16" => op.enc == Enc::Vop3 && i < 2 && !high(i),
+                        _ => false,
+                    }
+            })
+    };
+    // A full write of a 32-bit result: no partial, accumulating, lane or 64-bit forms.
+    let full_write = |op: &Insn| {
+        let m = op.mnemonic.as_str();
+        matches!(op.enc, Enc::Vop1 | Enc::Vop2 | Enc::Vop3)
+            && op.aux.sdwa.is_none()
+            && (m == "v_cvt_f32_f16" || m == "v_pack_b32_f16" || !["16", "64", "mac", "lane", "movrel"].iter().any(|s| m.contains(s)))
+    };
+    // A register range that may include `reg` without naming it, or an operand
+    // the decoder leaves raw (such as a DPP source).
+    let covers = |op: &Insn| {
+        let m = op.mnemonic.as_str();
+        if op.src.iter().any(|o| matches!(o, Opnd::Raw(_))) {
+            return true;
+        }
+        if matches!(op.enc, Enc::Mubuf | Enc::Mtbuf) && (m.starts_with("buffer_load_") || m.starts_with("tbuffer_load_")) {
+            // VDATA holds the loaded dwords (one more with TFE, bit 55); VADDR is one
+            // register, or an index and an offset with IDXEN and OFFEN (bits 13 and 12).
+            let words = Emitter::mubuf_dwords(m).or_else(|| m.split('_').next_back().map(|s| s.len() as u32));
+            let words = words.unwrap_or(16) + (op.raw.get(1).is_some_and(|w| w >> 23 & 1 != 0) as u32);
+            let addresses = 1 + (op.raw[0] >> 12 & 3 == 3) as u8;
+            let inside = |base: u8, count: u32| reg > base && u32::from(reg - base) < count;
+            return op.dst.iter().any(|o| matches!(o, Opnd::Vgpr(b) if inside(*b, words)))
+                || matches!(op.src.first(), Some(Opnd::Vgpr(a)) if inside(*a, u32::from(addresses)));
+        }
+        let wide = !matches!(op.enc, Enc::Vop1 | Enc::Vop2 | Enc::Vop3 | Enc::Vopc | Enc::Exp)
+            || ["64", "movrel"].iter().any(|s| m.contains(s));
+        wide && op.src.iter().chain(&op.dst).any(|o| matches!(o, Opnd::Vgpr(b) if *b < reg && reg - b < 16))
+    };
+    // Whether `op` may write `target`, by name or within a wider destination. The
+    // decoder gives V_NOP an operand it does not write, and names the register an
+    // S_CMPK compare reads as its destination.
+    let writes = |op: &Insn, target: Opnd| {
+        let m = op.mnemonic.as_str();
+        let lane_read = m == "v_readlane_b32";
+        m != "v_nop" && !m.starts_with("s_cmpk_") && op.dst.iter().any(|dst| {
+            // V_READLANE_B32 names its scalar destination as a vector register.
+            let dst = match *dst {
+                Opnd::Vgpr(n) if lane_read => Opnd::Sgpr(n),
+                dst => dst,
+            };
+            let width: u16 = match (op.enc, dst) {
+                // The dwords an SMEM load writes, as `live_in` counts them.
+                (Enc::Smem, _) => 1 << (op.op & 7),
+                (Enc::Sop1 | Enc::Sop2 | Enc::Sopk, _) | (Enc::Vop1 | Enc::Vop2 | Enc::Vop3, Opnd::Vgpr(_)) => {
+                    1 + u16::from(m.contains("64"))
+                }
+                _ if lane_read || m == "v_readfirstlane_b32" => 1,
+                // A wave64 lane mask.
+                (Enc::Vopc | Enc::Vop3, _) => 2,
+                // A destination this check does not size.
+                _ => 16,
+            };
+            match (dst, target) {
+                (Opnd::Sgpr(b), Opnd::Sgpr(n)) | (Opnd::Vgpr(b), Opnd::Vgpr(n)) => n >= b && u16::from(n - b) < width,
+                _ => false,
+            }
+        })
+    };
+    let target = |op: &Insn| {
+        (op.enc == Enc::Sopp && op.mnemonic.contains("branch"))
+            .then(|| (op.offset + 4).checked_add_signed(op.aux.imm as isize * 4))
+    };
+    let exec = |op: &Insn| {
+        op.dst.iter().any(|d| matches!(d, Opnd::ExecLo | Opnd::ExecHi))
+            || ["v_cmpx", "saveexec", "wrexec"].iter().any(|s| op.mnemonic.contains(s))
+    };
+    // V_READLANE_B32 names its scalar destination as a vector register.
+    let write = |op: &Insn| op.dst.first() == Some(&this) && op.mnemonic != "v_readlane_b32";
+    let touches = |op: &Insn| op.src.contains(&this) || write(op);
+    if insns.iter().any(|op| matches!(op.mnemonic.as_str(), "s_setpc_b64" | "s_swappc_b64")) {
+        return false;
+    }
+    let Some(first) = insns.iter().position(|op| op.mnemonic != "v_nop" && touches(op)) else {
+        return false;
+    };
+    if !half_write(&insns[first]) || insns[..first].iter().any(covers) {
+        return false;
+    }
+    let Some(guard) = insns[..first].iter().rposition(exec) else {
+        return false;
+    };
+    let (count, lane) = (exports.vertices, exports.lane_index);
+    let test = &insns[guard];
+    // The pair of SGPRs a `s_mov_b64 s[n:n+1], exec` before `at` saved and nothing
+    // rewrote since, with the index of the save.
+    let saved = |at: usize, pair: Opnd| {
+        let Opnd::Sgpr(n) = pair else { return None };
+        let high = Opnd::Sgpr(n.checked_add(1)?);
+        let save = insns[..at].iter().rposition(|op| writes(op, pair) || writes(op, high))?;
+        let op = &insns[save];
+        (op.mnemonic == "s_mov_b64" && op.dst[..] == [pair] && op.src[..] == [Opnd::ExecLo]).then_some(save)
+    };
+    let restore = |op: &Insn| match (op.mnemonic.as_str(), &op.dst[..], &op.src[..]) {
+        ("s_mov_b64", [Opnd::ExecLo], &[pair]) => Some(pair),
+        _ => None,
+    };
+    // The guard's branch skips to the restore that closes its block. The save that
+    // opens the block is the only EXEC change before the guard that matters: the
+    // guard narrows what it saved.
+    let Some(Some(end)) = insns.get(guard + 1).filter(|op| op.mnemonic == "s_cbranch_execz").and_then(target) else {
+        return false;
+    };
+    let Some(close) = insns.iter().position(|op| op.offset == end) else {
+        return false;
+    };
+    let Some(open) = restore(&insns[close]).and_then(|pair| saved(close, pair)) else {
+        return false;
+    };
+    if !(test.mnemonic == "v_cmpx_gt_u32" && test.enc == Enc::Vopc && test.aux.sdwa.is_none() && test.src[..] == [count, lane])
+        || open >= guard
+        || first >= close
+        || close >= exports.start
+        || insns[open + 1..guard].iter().any(exec)
+        || insns[guard + 1..].iter().any(|op| writes(op, count) || writes(op, lane))
+        || insns[close..exports.vertex_start].iter().any(|op| covers(op) || touches(op))
+    {
+        return false;
+    }
+    // Up to the export sequence, EXEC only narrows or returns to a value saved since
+    // `open`. Inside the guarded span the value was saved after the guard, so EXEC
+    // stays within the lanes the guard kept; afterwards it stays within those it
+    // started with. The export sequence narrows from there.
+    let narrowed = insns.iter().enumerate().take(exports.start).skip(open + 1).all(|(at, op)| {
+        if !exec(op) {
+            return true;
+        }
+        if (op.mnemonic.starts_with("v_cmpx_") && op.aux.sdwa.is_none()) || op.mnemonic == "s_and_saveexec_b64" {
+            return true;
+        }
+        let since = if at > guard && at < close { guard } else { open };
+        restore(op).and_then(|pair| saved(at, pair)).is_some_and(|save| save >= since)
+    });
+    if !narrowed {
+        return false;
+    }
+    let (tested, from, end) = (test.offset, insns[first].offset, insns[close].offset);
+    // Branches before the 16-bit write stay on their side of the guard. When the
+    // guard's own branch is taken, no lane is active.
+    let entered = insns[..first].iter().enumerate().all(|(at, op)| match target(op) {
+        None => true,
+        Some(None) => false,
+        Some(Some(t)) if at == guard + 1 => t > from,
+        Some(Some(t)) if at < guard => t <= tested,
+        Some(Some(t)) => t > tested && t <= from,
+    });
+    if !entered {
+        return false;
+    }
+    // From the 16-bit write on, no path comes back into the span that ends at
+    // `last`, and none from after the block comes back into it. When `last` is the
+    // full write, no path leaves the span before it, and EXEC does not change in
+    // it, so the full write reaches every lane the 16-bit write did.
+    let closed = |last: usize, full: bool| {
+        let to = insns[last].offset;
+        insns.iter().enumerate().skip(first).all(|(at, op)| match target(op) {
+            None => true,
+            Some(None) => false,
+            Some(Some(t)) if at < last => t > from && (t <= to || !full),
+            Some(Some(t)) => t > to && (at < close || t > end),
+        }) && !(full && insns[first..=last].iter().any(exec))
+    };
+    let mut last_read = first;
+    for (at, op) in insns.iter().enumerate().skip(first + 1) {
+        if op.mnemonic == "v_nop" {
+            continue;
+        }
+        if covers(op) {
+            return false;
+        }
+        let read = op.src.contains(&this);
+        if read && !low_half_read(op) {
+            return false;
+        }
+        if read {
+            last_read = at;
+        }
+        if write(op) && !half_write(op) {
+            return full_write(op) && closed(at, true);
+        }
+    }
+    closed(last_read, false)
 }
 
 /// The logical 64-lane wave is split across desktop invocations. A first-lane
