@@ -94,6 +94,27 @@ def root_shader(offset):
     return stage_container(0x50060, image(7, root_code(offset), (), used), [(b"PSV0", psv)])
 
 
+def recovered_root_shader():
+    """Two stores, one in an original table and one in an uncovered third-table slot.
+
+    Only the second descriptor has a corroborating user-data record: whole
+    reflection fails, so the provider must append the missing range rather
+    than replace the original layout.
+    """
+    info = bytearray(48)
+    info[24] = 5
+    struct.pack_into("<3I", info, 36, ROOT_THREADS, 1, 1)
+    resources = ([7, 0, 0, 0], [7, 2, 3, 3])
+    psv = pack([len(info)]) + info + pack([2, 16, *resources[0], *resources[1]])
+    first = list(root_code(0)[:-1])
+    first[0] = 0xBE800304  # s4, table 0
+    second = list(root_code(0x40))
+    second[0] = 0xBE800306  # s6, table 2
+    user = ([3, 16, 1, 3, 0x206],)
+    used = ([0x303, 0, 0, 1, 0x404], [0x303, 16, 3, 1, 0x20604])
+    return stage_container(0x50060, image(7, first + second, user, used), [(b"PSV0", psv)])
+
+
 def declaration(name, data):
     values = ",".join(str(byte) for byte in data)
     return (f"constexpr unsigned char {name}[] = {{{values}}};\n"
@@ -107,6 +128,7 @@ def header():
             + declaration("xbox_shader", shader()) + declaration("wave_shader", wave_shader())
             + f"constexpr unsigned wave_shader_expected[] = {{{words}}};\n"
             + declaration("root_shader", root_shader(0x40)) + declaration("root_refused_shader", root_shader(0xA0))
+            + declaration("recovered_root_shader", recovered_root_shader())
             + f"constexpr unsigned root_shader_expected = {ROOT_EXPECTED:#x};\n")
 
 

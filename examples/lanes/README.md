@@ -142,6 +142,19 @@ python tuxbox.py verify --only lanes-compute-root --output build/lanes-compute-r
 
 It runs on the Proton backend and removes only these programs' cache entries from the prefix.
 
+The separate `compute-root-recovery` scenario exercises partial reflection:
+a version 1.1 root declares three tables, and an independently corroborated
+FSSM/PSV record requires an additional slot in the third table. The first
+table is used but does not have a corroborating user-data record. With a
+logical 128-entry heap limited to 64 resident descriptors, both the original
+and extended table must bind correctly at dispatch; the shader writes two
+known words and all other words are guards. Stand-ins are disabled.
+
+```sh
+python tuxbox.py verify --only lanes-compute-root-recovery --output build/lanes-compute-root-recovery.json
+```
+
+
 ## Deterministic replay
 
 ```sh

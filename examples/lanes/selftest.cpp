@@ -814,7 +814,7 @@ void wave_alloc_scenario(ID3D12Device* device) {
 // through slot 5, past the table, so nothing can translate it for this root and
 // it gets a stand-in that writes nothing. A translation made without the root
 // cannot be bound, so falling back to one leaves view 10 with its decoy.
-void compute_root(ID3D12Device* device) {
+void compute_root_impl(ID3D12Device* device, bool recovery) {
     D3D12_DESCRIPTOR_RANGE ranges[]{
         {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0},
         {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 4, 0, 1, 0},
@@ -826,8 +826,24 @@ void compute_root(ID3D12Device* device) {
     }
     D3D12_ROOT_SIGNATURE_DESC signature{3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ComPtr<ID3DBlob> serialized;
-    check(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr),
-          "serialize three-table root signature");
+    if (recovery) {
+        D3D12_DESCRIPTOR_RANGE1 extended_ranges[3]{};
+        D3D12_ROOT_PARAMETER1 extended_params[3]{};
+        for (UINT i = 0; i < 3; ++i) {
+            extended_ranges[i] = {ranges[i].RangeType, ranges[i].NumDescriptors,
+                ranges[i].BaseShaderRegister, ranges[i].RegisterSpace,
+                D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, ranges[i].OffsetInDescriptorsFromTableStart};
+            extended_params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            extended_params[i].DescriptorTable = {1, &extended_ranges[i]};
+        }
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned{};
+        versioned.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+        versioned.Desc_1_1 = {3, extended_params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        check(D3D12SerializeVersionedRootSignature(&versioned, &serialized, nullptr), "serialize extended root");
+    } else {
+        check(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr),
+              "serialize three-table root signature");
+    }
     ComPtr<ID3D12RootSignature> root;
     check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
                                       IID_PPV_ARGS(&root)), "create three-table root signature");
@@ -839,9 +855,10 @@ void compute_root(ID3D12Device* device) {
                                                                             IID_PPV_ARGS(&pipeline));
     };
     ComPtr<ID3D12PipelineState> pipeline, refused;
-    check(create(root_shader, sizeof(root_shader), pipeline), "create pipeline from a root-less console program");
+    check(recovery ? create(recovered_root_shader, sizeof(recovered_root_shader), pipeline) :
+          create(root_shader, sizeof(root_shader), pipeline), "create pipeline from a root-less console program");
     // With stand-ins disabled the provider fails this creation instead.
-    const bool refused_created = SUCCEEDED(create(root_refused_shader, sizeof(root_refused_shader), refused));
+    const bool refused_created = !recovery && SUCCEEDED(create(root_refused_shader, sizeof(root_refused_shader), refused));
 
     // Sixteen raw views of one buffer. Table 0 starts at view 0, table 1 at view
     // 8 and table 2 at view 12, so the first program's descriptor is view 10.
@@ -855,13 +872,14 @@ void compute_root(ID3D12Device* device) {
     auto output = buffer(device, D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_COPY_DEST,
                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     auto readback = buffer(device, D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST);
-    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, views,
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, recovery ? 128u : views,
                                          D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     ComPtr<ID3D12DescriptorHeap> heap;
     check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)), "create root view heap");
     const UINT stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     const SIZE_T cpu_base = method<frame_abi::CpuHandle>(heap.Get(), 9)(heap.Get());
     const UINT64 gpu_base = method<GpuHandle>(heap.Get(), 10)(heap.Get());
+    const UINT base_view = recovery ? 80 : 0;
     for (UINT i = 0; i < views; ++i) {
         D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
         view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
@@ -869,7 +887,7 @@ void compute_root(ID3D12Device* device) {
         view.Buffer.FirstElement = UINT64(i) * view_words;
         view.Buffer.NumElements = view_words;
         view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-        device->CreateUnorderedAccessView(output.Get(), nullptr, &view, {cpu_base + SIZE_T(i) * stride});
+        device->CreateUnorderedAccessView(output.Get(), nullptr, &view, {cpu_base + SIZE_T(base_view + i) * stride});
     }
 
     Queue direct(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
@@ -882,7 +900,7 @@ void compute_root(ID3D12Device* device) {
     method<SetRoot>(list, slot_compute_root)(list, root.Get());
     constexpr UINT first_view[]{0, 8, 12};
     for (UINT i = 0; i < 3; ++i)
-        method<SetTable>(list, slot_compute_table)(list, i, {gpu_base + UINT64(first_view[i]) * stride});
+        method<SetTable>(list, slot_compute_table)(list, i, {gpu_base + UINT64(base_view + first_view[i]) * stride});
     if (refused_created) {
         list->SetPipelineState(refused.Get());
         list->Dispatch(1, 1, 1);
@@ -901,20 +919,30 @@ void compute_root(ID3D12Device* device) {
     std::vector<UINT> got(views * view_words);
     std::memcpy(got.data(), mapped, size_t(bytes));
     readback->Unmap(0, &empty);
+    if (recovery) {
+        for (UINT i = 0; i < views; ++i)
+            for (UINT j = 1; j < view_words; ++j)
+                if (got[i * view_words + j] != 0)
+                    throw std::runtime_error("recovery modified a guard word");
+    }
     for (UINT i = 0; i < views; ++i) {
         const UINT found = got[i * view_words];
-        if (found == (i == 10 ? root_shader_expected : decoy | i)) continue;
+        const bool written = recovery ? (i == 0 || i == 14) : i == 10;
+        if (found == (written ? root_shader_expected : decoy | i)) continue;
         char message[160];
-        if (i == 10 && found == (decoy | i))
-            std::snprintf(message, sizeof(message), "view 10 kept its decoy: a stand-in pipeline or a skipped dispatch");
+        if (written && found == (decoy | i))
+            std::snprintf(message, sizeof(message), "view %u kept its decoy: a stand-in pipeline or a skipped dispatch", i);
         else if (found == root_shader_expected)
-            std::snprintf(message, sizeof(message), "view %u was written, not table 1 slot 2 (view 10)", i);
+            std::snprintf(message, sizeof(message), "view %u was written unexpectedly", i);
         else
             std::snprintf(message, sizeof(message), "view %u: expected %#x, found %#x", i,
-                          i == 10 ? root_shader_expected : decoy | i, found);
+                          written ? root_shader_expected : decoy | i, found);
         throw std::runtime_error(message);
     }
 }
+
+void compute_root(ID3D12Device* device) { compute_root_impl(device, false); }
+void compute_root_recovery(ID3D12Device* device) { compute_root_impl(device, true); }
 
 ComPtr<ID3D12PipelineState> compute_pipeline(ID3D12Device* device, ComPtr<ID3D12RootSignature>& root,
                                           D3D12_SHADER_BYTECODE bytecode) {
@@ -1949,6 +1977,7 @@ constexpr Scenario scenarios[] = {
     {L"wave-alloc", wave_alloc_scenario},
     {L"raster-samplers", raster_samplers},
     {L"compute-root", compute_root},
+    {L"compute-root-recovery", compute_root_recovery},
 };
 
 // A fresh Scarlett device on the requested adapter. The factory is reached
@@ -2001,7 +2030,7 @@ const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue
                                              L"dispatch-wait", L"texture-readback", L"ray-tracing-builder",
                                              L"thread-dimensions", L"descriptor-reclaim",
                                              L"xbox-shader", L"wave64-shader",
-                                             L"raster-tables", L"wave-alloc", L"raster-samplers", L"compute-root"};
+                                             L"raster-tables", L"wave-alloc", L"raster-samplers", L"compute-root", L"compute-root-recovery"};
 const unsigned selftest_scenario_count = static_cast<unsigned>(std::size(selftest_scenarios));
 static_assert(std::size(selftest_scenarios) == std::size(scenarios));
 

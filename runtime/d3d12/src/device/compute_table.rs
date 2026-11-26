@@ -543,7 +543,15 @@ fn append_corroborated_ranges(
         for (index, param) in signature.params.iter().enumerate() {
             let RootParamKind::Table(declared) = &param.kind else { continue };
             let additions: Vec<_> = extra.iter().filter(|binding| binding.table as usize == index).collect();
+            // Replacing a root invalidates all native arguments, not just
+            // the table receiving the new range. With a paged heap the
+            // original tables also need a resident span for the dispatch.
+            let Some((mut extent, mut views)) = finite_table(declared) else {
+                return Ok(TableLayout::Unsupported);
+            };
             if additions.is_empty() {
+                lengths[index] = extent;
+                accessed_views.extend(views.into_iter().map(|range| (index, range)));
                 continue;
             }
             let table = parameters[index].Anonymous.DescriptorTable;
@@ -576,7 +584,7 @@ fn append_corroborated_ranges(
                 NumDescriptorRanges: stored[index].len() as u32,
                 pDescriptorRanges: stored[index].as_ptr(),
             };
-            let Some((mut extent, mut views)) = finite_table(declared) else { continue };
+
             for binding in &additions {
                 extent = extent.max(binding.slot.saturating_add(1));
                 if binding.kind < 2 {
