@@ -345,7 +345,12 @@ impl<'a> Emitter<'a> {
     }
 
     pub(in crate::hlsl) fn dynamic_code_offset(&self, idx: usize) -> Option<u8> {
-        if self.ex.stage != Stage::Compute || self.packed.is_some() || self.mesh_bindings.is_some() {
+        // Embedded code data is immutable and addressed by the same GETPC
+        // and scalar byte-offset instructions in compute and pixel programs.
+        // The proof checks the full possible address interval, not a lane
+        // value or the host wave width.
+        if !matches!(self.ex.stage, Stage::Compute | Stage::Pixel)
+            || self.packed.is_some() || self.mesh_bindings.is_some() {
             return None;
         }
         code_offset::prove(&self.insns, idx, self.ex.isa.len(), self.ex.isa_data.len())

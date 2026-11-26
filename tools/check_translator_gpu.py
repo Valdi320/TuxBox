@@ -80,6 +80,8 @@ CHECKS = {
                             extra=("--root-srv-remap",)),
     "third-table-atomic": Check("check_third_table_atomic",
                               capture=("third_compute_table_recovers_a_proven_atomic_uav", "--hlsl")),
+    "pixel-code-offset": Check("check_pixel_code_offset",
+                               capture=("pixel_embedded_table_offset_is_bounded_and_aligned", "--hlsl"), dxc=True),
     "dynamic-cbv": Check("check_dynamic_cbv", capture=("bounded_dynamic_cbv", "--hlsl"), dxc=True),
     "dynamic-code-offset": Check("check_dynamic_code_offset",
                                  capture=("bounded_runtime_code_offset", "--hlsl")),

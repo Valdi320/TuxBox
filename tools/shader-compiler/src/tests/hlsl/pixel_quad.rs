@@ -188,3 +188,23 @@ fn distinguishes_saved_coverage_from_scalar_bits() {
     assert!(!guards_expansion(&code, 2));
     assert!(!saved_exec(&code, 4));
 }
+
+#[test]
+fn pixel_embedded_table_offset_is_bounded_and_aligned() {
+    // gfx1030: getpc; mask and scale a scalar offset; load; export uint.
+    let words = [0xbe881f00, 0x870a830c, 0x8f0a820a, 0xf4000404,
+                 0x14000020, 0x7e080210, 0xf800080f, 0x04040404, 0xbf810000];
+    let mut ex = pixel(&words);
+    ex.isa_data.extend([101u32, 217, 333, 449].iter().flat_map(|x| x.to_le_bytes()));
+    let translated = super::super::translate(&ex).unwrap();
+    assert!(translated.hlsl.contains("tb_code["));
+    assert!(translated.hlsl.contains("s8 + s10 + 0x20u - 36u"));
+    println!("BEGIN_HLSL\n{}\nEND_HLSL", translated.hlsl);
+    let mut bad = ex.clone();
+    bad.isa_data.truncate(48);
+    assert!(super::super::translate(&bad).is_err());
+    let mut bad = ex.clone();
+    bad.isa[8..12].copy_from_slice(&0x8f0a810au32.to_le_bytes()); // scale by 2, not 4
+    bad.isa_data[..36].copy_from_slice(&bad.isa);
+    assert!(super::super::translate(&bad).is_err());
+}
