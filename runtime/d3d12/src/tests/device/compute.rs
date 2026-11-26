@@ -28,3 +28,16 @@ fn only_a_64_lane_program_on_a_32_lane_host_is_translated_again() {
     // The translation runs waves of 32, so a host limited below that cannot use it.
     assert!(!needs_narrow_waves(Some((64, 64)), (16, 16)));
 }
+
+#[test]
+fn compute_compile_labels_distinguish_rooted_narrow_and_original_attempts() {
+    let guest = "a".repeat(64);
+    let rooted = "b".repeat(64);
+    let narrow = format!("{rooted}_w32");
+    assert_eq!(compute_compile_label(Some(&guest), Some(&rooted), 123),
+               format!("CS aaaaaaaa request={rooted} bytes=123"));
+    assert_eq!(compute_compile_label(Some(&guest), Some(&narrow), 456),
+               format!("CS aaaaaaaa request={narrow} bytes=456"));
+    assert_eq!(compute_compile_label(Some(&guest), None, 789),
+               "CS aaaaaaaa request=original bytes=789");
+}

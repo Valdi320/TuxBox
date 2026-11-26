@@ -22,7 +22,7 @@ pub(super) fn remember(translation: &[u8], shader: &[u8]) {
 
 /// Ask the compiler to translate the program behind `translation` for 32-lane
 /// waves. `None` leaves the caller to refuse the ordinary translation as before.
-pub(crate) fn narrow_wave_variant(translation: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn narrow_wave_variant(translation: &[u8]) -> Option<(Vec<u8>, String)> {
     let shader = sources().get(&source_digest(translation)?)?.clone();
     let source = source_digest(&shader)?;
     let variant = compile::narrow_wave(&shader, &source)?;
@@ -33,5 +33,5 @@ pub(crate) fn narrow_wave_variant(translation: &[u8]) -> Option<Vec<u8>> {
     if LOADED.lock().unwrap_or_else(|error| error.into_inner()).insert(source.clone()) {
         crate::diagnostics::log(&format!("narrow-wave compute shader loaded, source SHA-256 {source}"));
     }
-    Some(variant)
+    Some((variant, format!("{source}_w32")))
 }
