@@ -97,6 +97,9 @@ class TriageScarlettShaders(unittest.TestCase):
         self.assertEqual(command("x", link, work)[1:6],
                          [link / "producer.dxbc", "--link-pixel", link / "pixel.dxbc", "--pixel-order", link / "pixel.cso"])
         self.assertIn("--hlsl-out", command("x", self.cache / f"{KEY}.dxbc", work))
+        wave = self.cache / f"{KEY}_w32.wave32"
+        self.assertEqual(command("x", wave, work)[1:3], [wave, "--wave32-host"])
+
 
     def test_stencil_without_target_is_a_failure_not_a_crash(self):
         source, status, reason = probe("x", self.cache / f"{KEY}.stencil", 1)

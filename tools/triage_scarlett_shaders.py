@@ -64,6 +64,8 @@ def command(xshader, source, work):
         if not sep:
             raise ValueError(f"stencil request without a render-target suffix: {source.name}")
         flags = ["--stencil-target", target]
+    elif source.suffix == ".wave32":
+        flags = ["--wave32-host"]
     return [xshader, cooked, *flags, "--hlsl-out", work / "shader.hlsl", "--profile-out", work / "profile"]
 
 
