@@ -455,9 +455,11 @@ class Host:
                 configure_console_cbv(self.backend, env, executable, log.status)
             capture = performance_capture(self.backend, env, executable, log) if mangohud else nullcontext()
             pipelines = pipeline_capture(self.backend, env, log) if profile_pipelines else nullcontext()
-            with capture, pipelines, runtime_shader_compiler(self.backend, env, executable, log.status), \
+            with capture, pipelines as timings, runtime_shader_compiler(self.backend, env, executable, log.status) as profile, \
                  game_diagnostics(self.backend, env, executable.parent, log.stderr_bytes,
                                   log_path=log.path) as stderr:
+                if timings is not None:
+                    timings["host_runtime"] = profile
                 return log.run([*self.command, str(executable), *arguments], cwd=executable.parent, env=env,
                                stderr_bytes=stderr)
         finally:

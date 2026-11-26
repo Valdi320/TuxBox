@@ -51,12 +51,12 @@ class DxilReuse(unittest.TestCase):
                 raise subprocess.TimeoutExpired(args, timeout)
             args[args.index("-Fo") + 1].write_bytes(container(args[-1].read_bytes()[:4]))
 
-    def compile(self, cache, data=b"shader"):
+    def compile(self, cache, data=b"shader", *, profile=None):
         key = hashlib.sha256(data).hexdigest()
         source = self.root / (key + ".dxbc")
         source.write_bytes(data)
         with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=self.run_tool):
-            self.assertTrue(compile_request(source, key, self.tools, cache, None))
+            self.assertTrue(compile_request(source, key, self.tools, cache, None, profile=profile))
         return (cache / (key + ".cso")).read_bytes()
 
     def test_output_built_with_other_compute_flags_is_not_reused(self):
@@ -72,6 +72,16 @@ class DxilReuse(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
         self.assertEqual((self.root / "runtime/b" / (hashlib.sha256(b"shader").hexdigest() + ".sha256")).read_text(),
                          hashlib.sha256(second).hexdigest())
+
+    def test_profile_counts_content_reuse_separately_from_compilation(self):
+        from project_tuxbox.shader_profile import ShaderProfile
+        first, second = ShaderProfile(), ShaderProfile()
+        self.assertEqual(self.compile(self.cache("a"), profile=first),
+                         self.compile(self.cache("b"), profile=second))
+        self.assertEqual(first.summary()["stages"]["dxc_default"]["calls"], 1)
+        self.assertEqual(second.summary()["requests"], {"compiled": 1})
+        self.assertEqual(second.summary()["reuse"], {"content": 1})
+        self.assertNotIn("dxc_default", second.summary()["stages"])
 
     def test_changed_hlsl_profile_or_toolchain_recompiles(self):
         self.compile(self.cache("a"))

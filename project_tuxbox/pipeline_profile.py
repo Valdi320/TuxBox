@@ -11,10 +11,36 @@ from tempfile import mkdtemp
 from .pipeline_prep import winpath
 
 
+def event_activity(intervals):
+    """Report summed event durations and their wall-time coverage separately.
+
+    Overlapping (including nested) vkd3d events do not imply separate
+    compiler threads. This is coverage of observed PSO events, not GPU
+    execution time or exclusively driver work.
+    """
+    boundaries = []
+    for start, end in intervals:
+        if end > start:
+            boundaries.extend(((start, 1), (end, -1)))
+    active = peak = 0
+    covered = 0.0
+    previous = None
+    for at, delta in sorted(boundaries):
+        if previous is not None and active:
+            covered += at - previous
+        active += delta
+        peak = max(peak, active)
+        previous = at
+    return dict(event_count=len(intervals),
+                summed_ms=round(math.fsum(end - start for start, end in intervals) / 1000, 3),
+                covered_ms=round(covered / 1000, 3), peak_overlapping_events=peak)
+
+
 def summarize(trace):
     totals = {}
     pipeline_kinds = {}
     slowest = []
+    intervals = []
     with trace.open(encoding="utf-8", errors="replace") as stream:
         # vkd3d writes one event per line and can exit without closing the array.
         for index, line in enumerate(stream):
@@ -36,12 +62,15 @@ def summarize(trace):
             if any(type(value) not in (int, float) for value in (duration, timestamp)):
                 continue
             try:
-                duration /= 1000
-                timestamp /= 1_000_000
+                duration, timestamp = float(duration), float(timestamp)
+                end = timestamp + duration
+                if duration < 0 or not all(math.isfinite(v) for v in (duration, timestamp, end)):
+                    continue
             except OverflowError:
                 continue
-            if not math.isfinite(duration) or not math.isfinite(timestamp):
-                continue
+            intervals.append((timestamp, end))
+            duration /= 1000
+            timestamp /= 1_000_000
             key, operation = match.groups()
             label = operation.split()[0]
             if label in ("GFX", "COMP", "LINK"):
@@ -58,7 +87,8 @@ def summarize(trace):
                 heapq.heappop(slowest)
     for group in totals.values():
         group["total_ms"] = round(group["total_ms"], 3)
-    return dict(groups=totals, slowest=[item[2] for item in sorted(slowest, reverse=True)])
+    return dict(groups=totals, activity=event_activity(intervals),
+                slowest=[item[2] for item in sorted(slowest, reverse=True)])
 
 
 @contextmanager
@@ -68,10 +98,13 @@ def pipeline_capture(backend, env, log):
     directory = Path(mkdtemp(prefix="pipelines-", dir=log.capture_parent())).resolve()
     trace = directory / "timeline.json"
     env.update(VKD3D_QUEUE_PROFILE=winpath(trace), VKD3D_QUEUE_PROFILE_ABSOLUTE="1")
+    env.setdefault("TUXBOX_PROFILE_SHADERS", "1")
     log.status(f"Pipeline timing capture: {trace}")
+    capture = {}
     try:
-        yield
+        yield capture
     finally:
+        result = None
         if trace.is_file():
             try:
                 result = summarize(trace)
@@ -82,6 +115,20 @@ def pipeline_capture(backend, env, log):
                 log.status(f"Could not summarize pipeline timings: {error}")
         else:
             log.status(f"The backend did not produce a pipeline trace at {trace}")
+        # Runtime workers are joined before this outer context exits. The
+        # report has no pipeline keys, raw names, paths, or game identifiers.
+        profile = capture.get("host_runtime")
+        try:
+            combined = directory / "stage-summary.json"
+            combined.write_text(json.dumps({
+                "schema": 1,
+                "host_runtime": profile.summary() if profile is not None else None,
+                "vkd3d_pipeline_events": ({k: result[k] for k in ("groups", "activity")}
+                                          if result is not None else None),
+            }, indent=2) + "\n")
+            log.status(f"Shader and pipeline stage timings: {combined}")
+        except (OSError, ValueError) as error:
+            log.status(f"Could not write stage timings: {error}")
 
 
 if __name__ == "__main__":

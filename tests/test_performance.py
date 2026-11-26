@@ -18,6 +18,7 @@ class PerformanceTests(unittest.TestCase):
             with pipeline_capture("proton", env, log):
                 first = Path(env["VKD3D_QUEUE_PROFILE"].removeprefix("Z:").replace("\\", "/"))
                 self.assertEqual(env["VKD3D_QUEUE_PROFILE_ABSOLUTE"], "1")
+                self.assertEqual(env["TUXBOX_PROFILE_SHADERS"], "1")
                 events = [
                     ("pso", "0000000000000001 GFX MISS", 100),
                     ("pso", "0000000000000001 FALLBACK OK", 155_500),
@@ -37,8 +38,36 @@ class PerformanceTests(unittest.TestCase):
             self.assertEqual(result["groups"]["driver_internal"]["calls"], 1)
             self.assertEqual(result["slowest"][0]["wine_seconds"], 2)
             self.assertEqual(result["slowest"][0]["operation"], "FALLBACK OK")
+            env["TUXBOX_PROFILE_SHADERS"] = "0"
             with pipeline_capture("proton", env, log):
                 self.assertNotIn(first.parent.name, env["VKD3D_QUEUE_PROFILE"])
+                self.assertEqual(env["TUXBOX_PROFILE_SHADERS"], "0")
+
+    def test_pipeline_stage_report_keeps_overlapping_time_and_missing_host_separate(self):
+        from project_tuxbox.shader_profile import ShaderProfile
+        with TemporaryDirectory() as tmp:
+            log = Mock(path=Path(tmp) / "run.log")
+            log.capture_parent.return_value = Path(tmp)
+            env = {}
+            profile = ShaderProfile()
+            profile.record("dxc_compute", 12_000_000, "ok")
+            with pipeline_capture("proton", env, log) as capture:
+                capture["host_runtime"] = profile
+                trace = Path(env["VKD3D_QUEUE_PROFILE"].removeprefix("Z:").replace("\\", "/"))
+                events = [(1000, 10000), (2000, 4000), (15000, 3000), (18000, 0), (1000, -1)]
+                trace.write_text("[\n" + "".join(json.dumps(dict(name="0000000000000001 COMP MISS",
+                                pid="pso", ph="X", ts=ts, dur=dur)) + ",\n" for ts, dur in events))
+            stages = json.loads(trace.with_name("stage-summary.json").read_text())
+            self.assertEqual(stages["host_runtime"]["stages"]["dxc_compute"]["total_ms"], 12)
+            self.assertEqual(stages["vkd3d_pipeline_events"]["activity"],
+                             {"event_count": 4, "summed_ms": 17, "covered_ms": 13, "peak_overlapping_events": 2})
+            self.assertNotIn("slowest", stages["vkd3d_pipeline_events"])
+            self.assertNotIn("0000000000000001", json.dumps(stages))
+            with pipeline_capture("proton", env, log):
+                trace = Path(env["VKD3D_QUEUE_PROFILE"].removeprefix("Z:").replace("\\", "/"))
+            missing = json.loads(trace.with_name("stage-summary.json").read_text())
+            self.assertIsNone(missing["host_runtime"])
+            self.assertIsNone(missing["vkd3d_pipeline_events"])
 
     def test_managed_capture_uses_its_own_config_and_finalizes_after_game_error(self):
         with TemporaryDirectory(prefix="hud test ") as tmp, patch("shutil.which", return_value="/usr/bin/mangohud"), \

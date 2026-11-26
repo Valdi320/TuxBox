@@ -14,6 +14,7 @@ from time import monotonic
 from .inspect import digest
 from .prep_progress import PrepPhase, desktop_progress, report_progress
 from .shader_inventory import decoder
+from .shader_profile import run_profiled_tool
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -82,8 +83,7 @@ class ToolFailure(ValueError):
 
 
 def run_tool(command, *, timeout=None):
-    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                            text=True, errors="replace", timeout=timeout)
+    result = run_profiled_tool(command, timeout=timeout)
     if result.returncode:
         raise ToolFailure(command[0], result.returncode, result.stderr[-600:].strip())
 
