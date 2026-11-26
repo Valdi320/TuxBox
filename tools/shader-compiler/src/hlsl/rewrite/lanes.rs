@@ -15,7 +15,7 @@ pub(in crate::hlsl) const LANE_TEMP_BASE: u16 = 10_000;
 /// tracks those temporaries like registers (keys 1000+), so descriptors survive a spill.
 ///
 /// Refused (explicit error): a non-constant lane index, a read of a slot that was never
-/// written, or a spill VGPR that is also used as an ordinary vector.
+/// written, or a spill VGPR whose ordinary vector lifetime cannot be separated.
 /// A read of one lane of the caller's 64-lane block, exchanged like `ds_swizzle_b32`.
 pub(in crate::hlsl) const GROUP_READ: &str = "tb_group_readlane";
 
@@ -212,6 +212,49 @@ pub(in crate::hlsl) fn lower_first_lane_reads(insns: &mut [Insn]) {
     }
 }
 
+/// Admit a mixed spill/vector register only in a straight-line, fixed-EXEC
+/// program whose ordinary operands have exact, single-register footprints.
+/// In particular, a vector read after the spill requires a new whole-word
+/// definition, and no vector definition can overlap the spill lifetime.
+/// Other encodings (including implicit wide operands) retain the refusal.
+fn disjoint_spill_lifetimes(insns: &[Insn], v: u8) -> bool {
+    let lane = |i: &Insn| i.enc == Enc::Vop3 && matches!(i.op, 0x360 | 0x361);
+    let touches = |i: &Insn| i.dst.contains(&Opnd::Vgpr(v)) || i.src.contains(&Opnd::Vgpr(v));
+    let spill = |i: &Insn| lane(i) && (if i.op == 0x361 {
+        i.dst.first() == Some(&Opnd::Vgpr(v))
+    } else { i.src.first() == Some(&Opnd::Vgpr(v)) });
+    let Some(first) = insns.iter().position(spill) else { return false; };
+    let Some(last) = insns.iter().rposition(spill) else { return false; };
+    let mut redefined = false;
+    for (n, i) in insns.iter().enumerate() {
+        if lane(i) {
+            // A writelane must have a scalar value; a readlane only reads
+            // the named vector, and its encoded destination is scalar.
+            if i.op == 0x361 && !matches!(i.src.first(), Some(Opnd::Sgpr(0..=105) | Opnd::ConstInt(_) | Opnd::Literal(_))) {
+                return false;
+            }
+            if i.op == 0x360 && !matches!(i.dst.as_slice(), [Opnd::Vgpr(0..=105) | Opnd::Sgpr(0..=105)]) {
+                return false;
+            }
+            continue;
+        }
+        let plain_move = i.enc == Enc::Vop1 && i.mnemonic == "v_mov_b32" && i.raw.len() == 1
+            && matches!(i.dst.as_slice(), [Opnd::Vgpr(_)]) && i.src.len() == 1;
+        let scalar_move = i.enc == Enc::Sop1 && i.mnemonic == "s_mov_b32"
+            && matches!(i.dst.as_slice(), [Opnd::Sgpr(0..=105)])
+            && !i.src.iter().any(|o| matches!(o, Opnd::Vgpr(_)));
+        let export = i.enc == Enc::Exp;
+        let nop = matches!(i.mnemonic.as_str(), "v_nop" | "s_nop" | "s_waitcnt" | "s_endpgm");
+        if !(plain_move || scalar_move || export || nop) { return false; }
+        if nop || !touches(i) { continue; }
+        if n < first { continue; }
+        if n <= last { return false; }
+        if i.src.contains(&Opnd::Vgpr(v)) && !redefined { return false; }
+        if plain_move && i.dst == [Opnd::Vgpr(v)] { redefined = true; }
+    }
+    true
+}
+
 pub(in crate::hlsl) fn lower_lane_spills(insns: &mut [Insn], wave32: bool, group_reads: bool) -> Result<(), String> {
     const READLANE: u32 = 0x360;
     const WRITELANE: u32 = 0x361;
@@ -235,6 +278,10 @@ pub(in crate::hlsl) fn lower_lane_spills(insns: &mut [Insn], wave32: bool, group
             _ => None,
         })
         .collect();
+    let disjoint: BTreeSet<_> = any_written.iter().copied()
+        .filter(|&v| insns.iter().any(|i| !is_lane(i) && i.mnemonic != "v_nop"
+            && i.dst.iter().chain(&i.src).any(|o| *o == Opnd::Vgpr(v))))
+        .filter(|&v| disjoint_spill_lifetimes(insns, v)).collect();
     for ins in insns.iter_mut() {
         if !is_lane(ins) {
             continue;
@@ -333,7 +380,7 @@ pub(in crate::hlsl) fn lower_lane_spills(insns: &mut [Insn], wave32: bool, group
         }
         for o in ins.dst.iter().chain(ins.src.iter()) {
             if let Opnd::Vgpr(v) = o {
-                if spill_vregs.contains(v) {
+                if spill_vregs.contains(v) && !disjoint.contains(v) {
                     return Err(format!("v{v} is used both as a lane spill area and as a vector at {:#x}", ins.offset));
                 }
             }

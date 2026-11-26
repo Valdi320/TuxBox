@@ -24,11 +24,12 @@ class Check:
 
     `emitter` names an example binary, or `xshader` for the compiler itself.
     `capture` names a unit test that prints the translation the tool runs and
-    the option that takes it.
+    the option that takes it. `captures` admits multiple named inputs.
     """
 
-    def __init__(self, tool, *, emitter=None, capture=None, llvm=False, dxc=False, extra=()):
+    def __init__(self, tool, *, emitter=None, capture=None, captures=(), llvm=False, dxc=False, extra=()):
         self.tool, self.emitter, self.capture = tool, emitter, capture
+        self.captures = ((capture,) if capture else ()) + tuple(captures)
         self.llvm, self.dxc, self.extra = llvm, dxc, extra
 
 
@@ -82,6 +83,9 @@ CHECKS = {
                               capture=("third_compute_table_recovers_a_proven_atomic_uav", "--hlsl")),
     "pixel-code-offset": Check("check_pixel_code_offset",
                                capture=("pixel_embedded_table_offset_is_bounded_and_aligned", "--hlsl"), dxc=True),
+    "pixel-lifetimes": Check("check_pixel_lifetimes", dxc=True, captures=(
+        ("pixel_mixed_spill_has_disjoint_vector_lifetime", "--spill"),
+        ("pixel_partial_unused_attributes_have_unique_layout", "--attr"))),
     "dynamic-cbv": Check("check_dynamic_cbv", capture=("bounded_dynamic_cbv", "--hlsl"), dxc=True),
     "dynamic-code-offset": Check("check_dynamic_code_offset",
                                  capture=("bounded_runtime_code_offset", "--hlsl")),
@@ -122,13 +126,20 @@ def capture(test, path):
     path.write_text(printed_block(run.stdout))
 
 
+def capture_inputs(name, work):
+    captures = CHECKS[name].captures
+    for test, option in captures:
+        suffix = "" if len(captures) == 1 else "-" + option.removeprefix("--")
+        yield test, option, work / f"{name}{suffix}.hlsl"
+
+
 def command_for(name, emitters, tools, host, work):
     check = CHECKS[name]
     command = [sys.executable, str(ROOT / "tools" / f"{check.tool}.py"), *check.extra]
     if check.emitter:
         command += ["--emitter", str(emitters[check.emitter])]
-    if check.capture:
-        command += [check.capture[1], str(work / f"{name}.hlsl")]
+    for test, option, path in capture_inputs(name, work):
+        command += [option, str(path)]
     if check.llvm:
         command += ["--llvm-mc", str(tools["llvm-mc"])]
     if check.dxc:
@@ -218,8 +229,8 @@ def main(argv=None):
         log = work / f"{name}.log"
         with log.open("w") as stream:
             try:
-                if CHECKS[name].capture:
-                    capture(CHECKS[name].capture[0], work / f"{name}.hlsl")
+                for test, option, path in capture_inputs(name, work):
+                    capture(test, path)
                 status = subprocess.run(command_for(name, emitters, tools, host, work), cwd=ROOT, stdout=stream,
                                         stderr=subprocess.STDOUT, timeout=600).returncode
             except subprocess.TimeoutExpired:

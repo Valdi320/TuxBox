@@ -208,3 +208,46 @@ fn pixel_embedded_table_offset_is_bounded_and_aligned() {
     bad.isa_data[..36].copy_from_slice(&bad.isa);
     assert!(super::super::translate(&bad).is_err());
 }
+
+#[test]
+fn pixel_mixed_spill_has_disjoint_vector_lifetime() {
+    // v128 has ordinary values before and after the scalar spill.
+    let words = [0x7f000287, 0x7e080380, 0xbe8c0393,
+                 0xd7610080, 0x0201000c, 0xd760000d, 0x02010180,
+                 0x7f000297, 0x7e0a0380, 0x7e0c020d,
+                 0xf800080f, 0x80060504, 0xbf810000];
+    let ex = pixel(&words);
+    let translated = super::super::translate(&ex).unwrap();
+    println!("BEGIN_HLSL\n{}\nEND_HLSL", translated.hlsl);
+    // Without a fresh full-vector definition after the spill, the ordinary
+    // read would see a mixture of saved scalar lanes and previous data.
+    let mut bad = words.to_vec();
+    bad.remove(7);
+    assert!(super::super::translate(&pixel(&bad)).is_err());
+    // A vector definition inside the spill lifetime destroys the saved lane.
+    let mut bad = words.to_vec();
+    bad.insert(5, 0x7f000297);
+    assert!(super::super::translate(&pixel(&bad)).is_err());
+    // A branch can bypass the definition; keep mixed lifetimes straight-line.
+    let mut bad = words.to_vec();
+    bad.insert(7, 0xbf840001);
+    assert!(super::super::translate(&pixel(&bad)).is_err());
+}
+
+#[test]
+fn pixel_partial_unused_attributes_have_unique_layout() {
+    let mut ex = pixel(&[0xc8120002, 0xc8160802,
+                         0xf800080f, 0x05040504, 0xbf810000]);
+    // attr0 = register 1, attr2 = register 3. Only the unused register 2
+    // can remain as a placeholder with an interpolant count of three.
+    ex.input_sig = (0..4).map(|reg| super::super::SigElement {
+        name: "TEXCOORD".into(), index: reg, sysval: 0, comp_type: 3,
+        register: reg, mask: 1, rw_mask: if reg % 2 == 1 { 1 } else { 0 },
+    }).collect();
+    ex.fssm.resize(0x23c, 0);
+    ex.fssm[0x238..0x23c].copy_from_slice(&3u32.to_le_bytes());
+    let translated = super::super::translate(&ex).unwrap();
+    assert!(translated.hlsl.contains("asuint(i.i1"), "{}", translated.hlsl);
+    assert!(translated.hlsl.contains("asuint(i.i3"), "{}", translated.hlsl);
+    println!("BEGIN_HLSL\n{}\nEND_HLSL", translated.hlsl);
+}
