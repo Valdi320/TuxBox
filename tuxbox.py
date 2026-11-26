@@ -17,6 +17,7 @@ except ImportError:
 
 from project_tuxbox.backend_log import check_log_path
 from project_tuxbox.game_log import game_log
+from project_tuxbox.launch_provenance import report_provider
 from project_tuxbox.graphics_profile import PROFILES, graphics_profile
 from project_tuxbox.host import Host, requires_offline
 from project_tuxbox.inspect import binary_file, image, launch_target, package, package_root
@@ -59,6 +60,7 @@ def run_game(args, exe, host, package_dir, profile=None):
         if host.offline:
             log.status("Network: offline. The game cannot reach servers or upload crash reports.")
         try:
+            report_provider(exe, log.status, require_current=args.require_current_provider)
             # Project Scarlett's recorded archive blocks launch for many minutes.
             # The runtime worker still compiles requests. --prepare-only keeps the archive pass.
             scarlett = exe.name.casefold() == "game_scarlett_master.exe"
@@ -108,6 +110,8 @@ def main():
     run.add_argument("--log-file", type=Path, metavar="PATH", help="also append the game log to this file; none is saved otherwise")
     run.add_argument("--mangohud", action="store_true",
                      help="show Vulkan performance metrics and record frame times beside the log file on Linux")
+    run.add_argument("--require-current-provider", action="store_true",
+                     help="refuse launch unless staged D3D12 DLL matches build/d3d12-smoke/d3d12_xs.dll")
     run.add_argument("--profile-pipelines", action="store_true",
                      help="record vkd3d-proton pipeline creation times and keys beside the log file")
     graphics = run.add_mutually_exclusive_group()
