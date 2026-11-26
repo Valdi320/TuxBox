@@ -66,6 +66,10 @@ class RasterFixtureTests(unittest.TestCase):
         self.assertEqual(bytes(int(value) for value in values.split(",")), raster_fixture.sampler_pixel())
         self.assertIn("raster_sampler_texels[] = {1.0f, 3.0f};", text)
         self.assertIn("raster_sampler_linear = 1.5f, raster_sampler_point = 1.0f;", text)
+        for name, data in (("mesh_sampler_mesh", raster_fixture.mesh()),
+                           ("mesh_sampler_pixel", raster_fixture.mesh_sampler_pixel())):
+            values = re.search(rf"{name}\[\] = \{{([0-9,]+)\}};", text).group(1)
+            self.assertEqual(bytes(int(value) for value in values.split(",")), data)
 
     def test_sampler_program_declares_the_roots_register_and_builds_a_literal_state(self):
         data = raster_fixture.sampler_pixel()
@@ -84,6 +88,26 @@ class RasterFixtureTests(unittest.TestCase):
         self.assertEqual(raster_fixture.SAMPLER_POINT, left)
 
 
+    def test_mesh_programs_name_a_second_sampler_and_a_moved_root_constant(self):
+        pixel = parts(raster_fixture.mesh_sampler_pixel())
+        program = fssm(pixel[b"DXIL"])
+        self.assertEqual(rows(program, 0xf0, 0xfc),
+                         [[0x300, 0, 0, 0, 0x1_0908], [0x401, 0, 0, 0, 0], [0x401, 0, 1, 0, 0]])
+        psv = pixel[b"PSV0"]
+        table = psv[4 + struct.unpack_from("<I", psv, 0)[0]:]
+        self.assertEqual(struct.unpack_from("<14I", table), (3, 16, 3, 1, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1))
+        # The rows moved the code past the default offset; the program is unchanged.
+        self.assertEqual(fssm(parts(raster_fixture.sampler_pixel())[b"DXIL"])[0x290:],
+                         program[16 + struct.unpack_from("<Q", program, 16 + 0x68)[0]:])
+        mesh = parts(raster_fixture.mesh())
+        self.assertNotIn(b"RTS0", mesh)
+        self.assertEqual(struct.unpack_from("<I", mesh[b"DXIL"], 0)[0] >> 16, 13)
+        self.assertEqual(mesh[b"PSV0"][28], 13)
+        program = fssm(mesh[b"DXIL"])
+        self.assertEqual(rows(program, 0xe8, 0xf8), [[0, 0, 1, 501, 0x200]])
+        self.assertEqual(rows(program, 0xf0, 0xfc), [[2, 0, 501, 0, 0x2_0004]])
+
+
 def trace(slots):
     return ('multi-table raster roots after 1 pipelines: {"reflected": 1}\n'
             f"created raster pipeline with {slots} reflected FSSM descriptor slots\n")
@@ -94,7 +118,9 @@ class RasterGateTests(unittest.TestCase):
 
     def run_gate(self, output, compiled, scenario="raster-tables"):
         rootless = [hashlib.sha256(data).hexdigest()
-                    for data in (raster_fixture.vertex(), raster_fixture.pixel(), raster_fixture.sampler_pixel())]
+                    for data in (raster_fixture.vertex(), raster_fixture.pixel(), raster_fixture.sampler_pixel(),
+                                 raster_fixture.mesh_sampler_pixel())]
+        mesh_key = hashlib.sha256(raster_fixture.mesh()).hexdigest()
         with TemporaryDirectory() as prefix:
             sources = Path(prefix) / SOURCE_CACHE
             runtime = sources.parent / "runtime/fingerprint"
@@ -117,13 +143,21 @@ class RasterGateTests(unittest.TestCase):
                     report(f"Compiled Xbox shader {key}")
 
             calls = {}
+            mesh_cso = sources / f"{mesh_key}.cso"
 
             def check(name, binary, arguments, match, log_check=None, **_):
                 calls[name] = {"arguments": arguments, "stale": [path.exists() for path in stale],
-                               "problem": log_check}
+                               "problem": log_check, "mesh": mesh_cso.exists()}
                 return {}
 
-            with mock.patch("project_tuxbox.runtime_shaders.shader_session", session):
+            def run_tool(command, **_):
+                # The mesh program's desktop translation, compiled into the prepared cache.
+                seen["mesh_command"] = [str(part) for part in command]
+                Path(command[command.index("-Fo") + 1]).write_bytes(b"")
+
+            with mock.patch("project_tuxbox.runtime_shaders.shader_session", session), \
+                    mock.patch("project_tuxbox.shader_prep.compiler_tools", lambda: ("xshader", "dxc", "dxv")), \
+                    mock.patch("project_tuxbox.shader_prep.run_tool", run_tool):
                 lanes_raster_tables(SimpleNamespace(env=env), check, ["--adapter", "10de:2c02"], "10de:2c02", ())
             seen["calls"] = list(calls)
             seen.update(calls[f"lanes-{scenario}"])
@@ -135,7 +169,7 @@ class RasterGateTests(unittest.TestCase):
 
     def test_reflected_draw_passes_and_cleans_its_entries(self):
         seen, _ = self.run_gate(self.TRACE, ["a" * 64, "b" * 64])
-        self.assertEqual(seen["calls"], ["lanes-raster-tables", "lanes-raster-samplers"])
+        self.assertEqual(seen["calls"], ["lanes-raster-tables", "lanes-raster-samplers", "lanes-mesh-samplers", "lanes-mesh-sampler-single"])
         self.assertEqual(seen["arguments"][:2], ["--selftest", "raster-tables"])
         self.assertEqual(seen["stale"], [False, False])
         self.assertNotIn("TUXBOX_RASTER_ROOT_FALLBACK", seen["env"])
@@ -166,9 +200,28 @@ class RasterGateTests(unittest.TestCase):
         # The two-table trace names another pipeline.
         self.assertIn("did not create", self.run_gate(self.TRACE, [], "raster-samplers")[0]["problem"])
 
+    def test_mesh_draw_prepares_its_mesh_and_needs_the_mesh_pipeline(self):
+        mesh_trace = ("created Xbox mesh pipeline (680-byte stream, amplification=false)\n"
+                      f"created raster pipeline with {verify_module.MESH_SAMPLER_SLOTS} reflected FSSM descriptor slots\n")
+        seen, rootless = self.run_gate(mesh_trace, [], "mesh-samplers")
+        self.assertEqual(seen["arguments"][:2], ["--selftest", "mesh-samplers"])
+        self.assertIsNone(seen["problem"])
+        # Only this scenario has the prepared mesh translation, and it is removed after.
+        self.assertEqual(seen["mesh"], True)
+        self.assertEqual(seen["calls"], ["lanes-raster-tables", "lanes-raster-samplers", "lanes-mesh-samplers", "lanes-mesh-sampler-single"])
+        self.assertEqual(seen["mesh_command"][1:5], ["-T", "ms_6_5", "-E", "main"])
+        self.assertTrue(seen["mesh_command"][-1].endswith("examples/lanes/mesh_samplers.hlsl"))
+        self.assertEqual(seen["left"], ["title.cso"])
+        # No mesh pipeline, a stand-in, or the pixel program's root-less translation fail.
+        self.assertIn("mesh pipeline", self.run_gate(trace(1), [], "mesh-samplers")[0]["problem"])
+        self.assertIn("stand-in", self.run_gate(mesh_trace + "substituted null raster stream pipeline\n", [],
+                                                "mesh-samplers")[0]["problem"])
+        self.assertIn("without its root", self.run_gate(mesh_trace, [rootless[3]], "mesh-samplers")[0]["problem"])
+
     def test_scenario_runs_only_under_the_worker(self):
         self.assertNotIn("raster-tables", LANES_SCENARIOS)
         self.assertNotIn("raster-samplers", LANES_SCENARIOS)
+        self.assertNotIn("mesh-samplers", LANES_SCENARIOS)
         self.assertIn("lanes-raster-tables", BASE_SUITES)
 
 

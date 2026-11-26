@@ -13,6 +13,14 @@ linear clamped sampler it builds from literal words, as the console compiles a
 static sampler into the program. It declares that sampler as `s0`, where the
 title's root has a point-filtered static sampler, so only the literal words
 give the console's result.
+
+The `mesh-samplers` pixel program is the same, drawn through a mesh pipeline. It
+declares two samplers, `s0` and `s1`, both of which the title's root has as
+point-filtered static samplers, so no declared register can stand in for the
+literal state. Its mesh program is a records-only console container: its FSSM
+records name root constant `b501` where the root declares `b500`, so the
+provider rewrites the root for the mesh stage, and its translation is a desktop
+mesh shader (`mesh_samplers.hlsl`) prepared under its digest.
 """
 from pathlib import Path
 import struct
@@ -72,17 +80,30 @@ SAMPLER_PIXEL_RESOURCES = ([3, 1, 0, 0], [1, 0, 0, 0])
 SAMPLER_TEXELS = (1.0, 3.0)
 SAMPLER_LINEAR, SAMPLER_POINT = 1.5, 1.0
 
+# The mesh pipeline's pixel program declares a second static sampler, s1, so
+# that neither declared register is the program's only one.
+MESH_SAMPLER_PIXEL_USED = (*SAMPLER_PIXEL_USED, [0x401, 0, 1, 0, 0])
+MESH_SAMPLER_PIXEL_RESOURCES = (*SAMPLER_PIXEL_RESOURCES, [1, 0, 1, 1])
+# The mesh program's records: root constant parameter 2 in s8, named b500 by the
+# title's root and b501 by the program, so the mesh stage gets a root of its own.
+MESH_USER = ([0, 0, 1, 501, 0x200],)
+MESH_USED = ([2, 0, 501, 0, 0x2_0004],)
+MESH_RESOURCES = ([2, 0, 501, 501],)
+MESH_CODE = (0xBF810000,)  # s_endpgm: the desktop replacement runs instead
+
 ABSENT = 0xDEADBEEFDEADBEEF
 ROWS_AT, CODE_AT = 0x240, 0x280
 
 
 def image(slot, code, user=(), used=(), inputs=0):
     """An FSSM 1.1 image with one stage descriptor at 0x68, after the directory."""
-    data = bytearray(CODE_AT)
+    # The code follows the rows; more than three rows move it later.
+    code_at = max(CODE_AT, -(-(ROWS_AT + 20 * (len(user) + len(used))) // 0x40) * 0x40)
+    data = bytearray(code_at)
     struct.pack_into("<Q", data, 0, 6)
     for n in range(12):
         struct.pack_into("<Q", data, 8 + 8 * n, 0x68 if n == slot else ABSENT)
-    struct.pack_into("<QQ", data, 0x68, CODE_AT, 4 * len(code))
+    struct.pack_into("<QQ", data, 0x68, code_at, 4 * len(code))
     # Descriptor fields at 0xd8: user-data and used-resource row offsets and counts.
     used_at = ROWS_AT + 20 * len(user)
     struct.pack_into("<QQII", data, 0xd8, ROWS_AT if user else 0, used_at if used else 0, len(user), len(used))
@@ -153,6 +174,22 @@ def sampler_pixel():
     ])
 
 
+def mesh_sampler_pixel():
+    return container(0x60, image(5, SAMPLER_PIXEL_CODE, SAMPLER_PIXEL_USER, MESH_SAMPLER_PIXEL_USED, inputs=2), [
+        (b"ISGN", signature([("SV_Position", 0, 1, 3, 0, 15, 0)])),
+        (b"OSGN", signature([("SV_Target", 0, 64, 3, 0, 1, 0)])),
+        (b"PSV0", validation(0, MESH_SAMPLER_PIXEL_RESOURCES)),
+    ])
+
+
+def mesh():
+    """The records-only console mesh program (shader model 6.5, stage 13)."""
+    return container(0xD0065, image(2, MESH_CODE, MESH_USER, MESH_USED), [
+        (b"OSGN", signature([("SV_Position", 0, 1, 3, 0, 15, 0)])),
+        (b"PSV0", validation(13, MESH_RESOURCES)),
+    ])
+
+
 def header(vertex_data, pixel_data, sampler_data=None):
     def array(name, data):
         return f"constexpr unsigned char {name}[] = {{{','.join(str(byte) for byte in data)}}};\n"
@@ -163,7 +200,8 @@ def header(vertex_data, pixel_data, sampler_data=None):
             + f"constexpr UINT raster_expected = {EXPECTED:#x}, raster_decoy = {DECOY:#x};\n"
             + array("raster_sampler_pixel", sampler_data)
             + f"constexpr float raster_sampler_texels[] = {{{texels}}};\n"
-            + f"constexpr float raster_sampler_linear = {SAMPLER_LINEAR!r}f, raster_sampler_point = {SAMPLER_POINT!r}f;\n")
+            + f"constexpr float raster_sampler_linear = {SAMPLER_LINEAR!r}f, raster_sampler_point = {SAMPLER_POINT!r}f;\n"
+            + array("mesh_sampler_mesh", mesh()) + array("mesh_sampler_pixel", mesh_sampler_pixel()))
 
 
 if __name__ == "__main__":

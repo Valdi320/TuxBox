@@ -56,6 +56,7 @@ The game also imports Windows core API sets for services such as files, timing a
 | `wave64-shader` | A console shader that sums across 64-lane waves, translated while the game runs; not part of `all` |
 | `raster-tables` | A console vertex and pixel pair drawn under a root with two descriptor tables, reading through the second ([raster tables](#raster-tables)) |
 | `raster-samplers` | A console pixel program's literal linear sampler, under a root whose static sampler at that register is point-filtered ([raster tables](#raster-tables)) |
+| `mesh-samplers` | The same literal sampler in a mesh pipeline, whose mesh root the provider builds ([raster tables](#raster-tables)); not part of `all` |
 
 ```sh
 python tuxbox.py verify --only lanes-selftest --output build/lanes-selftest.json
@@ -118,7 +119,9 @@ The `raster-tables` scenario draws a fullscreen triangle with two hand-written c
 
 The `raster-samplers` scenario draws with the same vertex program and a third hand-written pixel program. It samples a 2x1 texture of 1.0 and 3.0, at table 1 slot 0, with a linear clamped sampler it builds from literal words, as the console compiles a static sampler into a program. It declares that sampler as `s0`, where the title's root has a point-filtered static sampler. The provider has to give the literal state a static sampler of its own in the reflected root, so every texel reads 1.5. Bound to the root's `s0`, the texels read the point-filtered 1.0.
 
-That root is made while the game runs, so nothing can be prepared before launch. `verify` runs both scenarios with the host worker, requires the provider to report the reflected root and pipeline, and fails if either program was translated without a root.
+The `mesh-samplers` scenario samples the same way through a mesh pipeline. Its pixel program declares `s0` and `s1`, which the title's root has as point-filtered static samplers, so neither register can stand in for the literal state and the program does not translate against that root. Its mesh program is a console container with FSSM records only: they name the root constant `b501` where the root declares `b500`, so the provider builds the mesh stage a root of its own. The provider has to add the literal state to that root as a private static sampler and translate the pixel program against it, so every texel reads 1.5. Without that it falls back to the pixel program's translation without a root, whose private sampler the pipeline's root lacks, and the pipeline becomes a stand-in. The mesh program's desktop translation (`mesh_samplers.hlsl`, a fullscreen triangle) is compiled into the prepared cache under its digest before launch.
+
+These roots are made while the game runs, so the pixel programs cannot be prepared before launch. `verify` runs the three scenarios with the host worker, requires the provider to report the reflected root (for the vertex pipelines) or the mesh pipeline and its descriptor slots, and fails if a pixel or vertex program was translated without a root.
 
 ```sh
 python tuxbox.py verify --only lanes-raster-tables --output build/lanes-raster-tables.json

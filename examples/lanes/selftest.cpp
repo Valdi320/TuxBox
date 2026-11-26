@@ -41,7 +41,7 @@ constexpr UINT kWaveAllocSentinel = 0xdeadbeefu;
 // Xbox command-list and queue slots (GDK gen9/d3d12_xs.h).
 constexpr size_t slot_copy_memory = 62, slot_write32 = 71, slot_write64 = 72, slot_wait64 = 74,
                  slot_dispatch_flagged = 80, slot_copy_texture = 83, slot_build = 119,
-                 slot_emit_sizes = 120, slot_sync_top = 131, slot_sync_bottom = 132;
+                 slot_emit_sizes = 120, slot_dispatch_mesh = 129, slot_sync_top = 131, slot_sync_bottom = 132;
 constexpr size_t slot_compute_root = 33, device_create_compute = 62, device_create_stream = 86;
 constexpr size_t slot_bind_heaps = 32, slot_compute_table = 35, queue_wait = 17;
 constexpr size_t slot_graphics_root = 34, slot_graphics_table = 36, slot_targets = 50, slot_clear_target = 52;
@@ -53,6 +53,7 @@ using Write32 = void (WINAPI*)(ID3D12GraphicsCommandList*, UINT64, UINT, UINT, U
 using Write64 = void (WINAPI*)(ID3D12GraphicsCommandList*, UINT64, UINT64, UINT, UINT);
 using Wait64 = void (WINAPI*)(ID3D12GraphicsCommandList*, UINT64, D3D12_COMPARISON_FUNC, UINT64, UINT);
 using DispatchFlagged = void (WINAPI*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT);
+using DispatchMesh = void (WINAPI*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT);
 using Build = void (WINAPI*)(ID3D12GraphicsCommandList*, const void*, UINT, const void*);
 using Sync = void (WINAPI*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT64, UINT64);
 using SignalQueue = HRESULT (WINAPI*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
@@ -498,8 +499,9 @@ void wave64_shader_scenario(ID3D12Device* device) {
 }
 
 // A root with two SRV tables (t0, space0; t0 to t3, space1) and one root
-// constant, optionally with a static sampler, for the console raster programs.
-ComPtr<ID3D12RootSignature> two_table_root(ID3D12Device* device, const D3D12_STATIC_SAMPLER_DESC* sampler) {
+// constant (b500), optionally with static samplers, for the console raster programs.
+ComPtr<ID3D12RootSignature> two_table_root(ID3D12Device* device, const D3D12_STATIC_SAMPLER_DESC* samplers,
+                                           UINT count = 1) {
     D3D12_DESCRIPTOR_RANGE1 ranges[]{
         {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0},
         {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 1, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0}};
@@ -511,7 +513,7 @@ ComPtr<ID3D12RootSignature> two_table_root(ID3D12Device* device, const D3D12_STA
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[2].Constants = {500, 0, 1};
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC signature{D3D_ROOT_SIGNATURE_VERSION_1_1};
-    signature.Desc_1_1 = {3, params, sampler ? 1u : 0u, sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    signature.Desc_1_1 = {3, params, samplers ? count : 0u, samplers, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ComPtr<ID3DBlob> serialized;
     check(D3D12SerializeVersionedRootSignature(&signature, &serialized, nullptr),
           "serialize two-table root signature");
@@ -521,15 +523,11 @@ ComPtr<ID3D12RootSignature> two_table_root(ID3D12Device* device, const D3D12_STA
     return root;
 }
 
-// Draws a fullscreen triangle with the console vertex program and `pixel` under
-// `root`, into a 16x16 target of 32-bit `format` cleared to zero. Table N is
-// bound at view `tables[N]` of `view_heap`. Returns the texels, row by row.
-std::vector<UINT> draw_console_raster(ID3D12Device* device, ID3D12RootSignature* root, D3D12_SHADER_BYTECODE pixel,
-                                      DXGI_FORMAT format, ID3D12DescriptorHeap* view_heap,
-                                      std::initializer_list<UINT> tables) {
-    frame_abi::RasterPipelineStream parts;
+// The stream parts a console raster draw shares, for a vertex or a mesh pipeline.
+template <class Stream>
+ComPtr<ID3D12PipelineState> console_pipeline(ID3D12Device* device, Stream& parts, ID3D12RootSignature* root,
+                                             D3D12_SHADER_BYTECODE pixel, DXGI_FORMAT format) {
     parts.root.payload = root;
-    parts.vs.payload = {raster_vertex, sizeof(raster_vertex)};
     parts.ps.payload = pixel;
     parts.raster.payload.FillMode = D3D12_FILL_MODE_SOLID;
     parts.raster.payload.CullMode = D3D12_CULL_MODE_NONE;
@@ -542,6 +540,26 @@ std::vector<UINT> draw_console_raster(ID3D12Device* device, ID3D12RootSignature*
     ComPtr<ID3D12PipelineState> pipeline;
     check(method<CreateStreamPipeline>(device, device_create_stream)(device, &stream, IID_PPV_ARGS(&pipeline)),
           "create pipeline from console raster programs");
+    return pipeline;
+}
+
+// Draws a fullscreen triangle with the console vertex program, or with `mesh`
+// when it is given, and `pixel` under `root`, into a 16x16 target of 32-bit
+// `format` cleared to zero. Table N is bound at view `tables[N]` of `view_heap`.
+// Returns the texels, row by row.
+std::vector<UINT> draw_console_raster(ID3D12Device* device, ID3D12RootSignature* root, D3D12_SHADER_BYTECODE pixel,
+                                      DXGI_FORMAT format, ID3D12DescriptorHeap* view_heap,
+                                      std::initializer_list<UINT> tables, D3D12_SHADER_BYTECODE mesh = {}) {
+    ComPtr<ID3D12PipelineState> pipeline;
+    if (mesh.BytecodeLength) {
+        frame_abi::MeshPipelineStream parts;
+        parts.ms.payload = mesh;
+        pipeline = console_pipeline(device, parts, root, pixel, format);
+    } else {
+        frame_abi::RasterPipelineStream parts;
+        parts.vs.payload = {raster_vertex, sizeof(raster_vertex)};
+        pipeline = console_pipeline(device, parts, root, pixel, format);
+    }
 
     constexpr UINT side = 16, pitch = 256;
     const UINT stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -582,8 +600,12 @@ std::vector<UINT> draw_console_raster(ID3D12Device* device, ID3D12RootSignature*
     list->RSSetViewports(1, &viewport);
     list->RSSetScissorRects(1, &scissor);
     list->SetPipelineState(pipeline.Get());
-    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    list->DrawInstanced(3, 1, 0, 0);
+    if (mesh.BytecodeLength) {
+        method<DispatchMesh>(list, slot_dispatch_mesh)(list, 1, 1, 1);
+    } else {
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list->DrawInstanced(3, 1, 0, 0);
+    }
     compute_fixture::transition(list, target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                                 D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION from{}, to{};
@@ -656,14 +678,8 @@ void raster_tables(ID3D12Device* device) {
     }
 }
 
-// A console pixel program samples a texture with a linear clamped sampler it
-// builds from literal words, as the console compiles a static sampler into the
-// program. It declares that sampler as s0, where the title's root has a
-// point-filtered static sampler in another state. The console samples with the
-// literal state, so the provider must give that state a static sampler of its
-// own (`inline_sampler::unmatched`). Bound to the root's s0, the draw reads the
-// point-filtered value; a refused translation leaves a stand-in and the clear value.
-void raster_samplers(ID3D12Device* device) {
+// A point-filtered, clamped static sampler at register `slot`, space0.
+D3D12_STATIC_SAMPLER_DESC point_sampler(UINT slot) {
     D3D12_STATIC_SAMPLER_DESC point{};
     point.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
     point.AddressU = point.AddressV = point.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -671,10 +687,16 @@ void raster_samplers(ID3D12Device* device) {
     point.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
     point.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
     point.MaxLOD = 12;
+    point.ShaderRegister = slot;
     point.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    auto root = two_table_root(device, &point);
+    return point;
+}
 
-    // A 2x1 texture the program samples a quarter of the way between its texels.
+// Draws `pixel` (and `mesh`, when given) under `root` with the 2x1 texture the
+// sampler programs read, sampled a quarter of the way between its texels, and
+// requires every texel to hold the linear-filtered value.
+void draw_linear_sample(ID3D12Device* device, ID3D12RootSignature* root, D3D12_SHADER_BYTECODE pixel,
+                        D3D12_SHADER_BYTECODE mesh = {}) {
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     heap.CreationNodeMask = heap.VisibleNodeMask = 1;
@@ -722,8 +744,7 @@ void raster_samplers(ID3D12Device* device) {
     for (UINT i = 0; i < views; ++i)
         device->CreateShaderResourceView(i == 8 ? texture.Get() : nullptr, &srv, {cpu_base + SIZE_T(i) * stride});
 
-    const auto texels = draw_console_raster(device, root.Get(), {raster_sampler_pixel, sizeof(raster_sampler_pixel)},
-                                            DXGI_FORMAT_R32_FLOAT, view_heap.Get(), {0, 8});
+    const auto texels = draw_console_raster(device, root, pixel, DXGI_FORMAT_R32_FLOAT, view_heap.Get(), {0, 8}, mesh);
     for (UINT i = 0; i < texels.size(); ++i) {
         float found;
         std::memcpy(&found, &texels[i], sizeof(found));
@@ -740,6 +761,46 @@ void raster_samplers(ID3D12Device* device) {
                           raster_sampler_linear, found);
         throw std::runtime_error(message);
     }
+}
+
+// A console pixel program samples a texture with a linear clamped sampler it
+// builds from literal words, as the console compiles a static sampler into the
+// program. It declares that sampler as s0, where the title's root has a
+// point-filtered static sampler in another state. The console samples with the
+// literal state, so the provider must give that state a static sampler of its
+// own (`inline_sampler::unmatched`). Bound to the root's s0, the draw reads the
+// point-filtered value; a refused translation leaves a stand-in and the clear value.
+void raster_samplers(ID3D12Device* device) {
+    const auto point = point_sampler(0);
+    auto root = two_table_root(device, &point);
+    draw_linear_sample(device, root.Get(), {raster_sampler_pixel, sizeof(raster_sampler_pixel)});
+}
+
+// The same pixel program in a mesh pipeline. It declares s0 and s1, which the
+// title's root has as point-filtered static samplers, so no declared register
+// can stand in for the literal linear state and its translation against that
+// root is refused. The mesh program's records name b501 where the root has b500,
+// so the provider builds the pipeline a mesh root of its own; it must add the
+// literal state to that root as a private static sampler and translate the
+// pixel program against it. Without that the provider falls back to the pixel
+// program's root-less translation, whose private sampler the root lacks: the
+// pipeline becomes a stand-in and the target keeps its clear value. The mesh
+// program's desktop translation is prepared before launch (`mesh_samplers.hlsl`).
+void mesh_samplers(ID3D12Device* device) {
+    const D3D12_STATIC_SAMPLER_DESC points[]{point_sampler(0), point_sampler(1)};
+    auto root = two_table_root(device, points, UINT(std::size(points)));
+    draw_linear_sample(device, root.Get(), {mesh_sampler_pixel, sizeof(mesh_sampler_pixel)},
+                       {mesh_sampler_mesh, sizeof(mesh_sampler_mesh)});
+}
+
+// The `raster-samplers` pixel program, declaring only s0, in a mesh pipeline
+// under a root whose s0 is point-filtered. The translation can bind the literal
+// state to the one declared register, whatever state the root gives it.
+void mesh_sampler_single(ID3D12Device* device) {
+    const auto point = point_sampler(0);
+    auto root = two_table_root(device, &point);
+    draw_linear_sample(device, root.Get(), {raster_sampler_pixel, sizeof(raster_sampler_pixel)},
+                       {mesh_sampler_mesh, sizeof(mesh_sampler_mesh)});
 }
 
 
@@ -1838,6 +1899,8 @@ constexpr Scenario scenarios[] = {
     {L"raster-tables", raster_tables},
     {L"wave-alloc", wave_alloc_scenario},
     {L"raster-samplers", raster_samplers},
+    {L"mesh-samplers", mesh_samplers},
+    {L"mesh-sampler-single", mesh_sampler_single},
 };
 
 // A fresh Scarlett device on the requested adapter. The factory is reached
@@ -1890,7 +1953,8 @@ const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue
                                              L"dispatch-wait", L"texture-readback", L"ray-tracing-builder",
                                              L"thread-dimensions", L"descriptor-reclaim",
                                              L"xbox-shader", L"wave64-shader",
-                                             L"raster-tables", L"wave-alloc", L"raster-samplers"};
+                                             L"raster-tables", L"wave-alloc", L"raster-samplers", L"mesh-samplers",
+                                             L"mesh-sampler-single"};
 const unsigned selftest_scenario_count = static_cast<unsigned>(std::size(selftest_scenarios));
 static_assert(std::size(selftest_scenarios) == std::size(scenarios));
 
@@ -1900,8 +1964,10 @@ std::string run_selftest(const wchar_t* requested, const wchar_t* adapter) {
     char pci[16]{};
     for (const auto& scenario : scenarios) {
         if (!all && std::wcscmp(requested, scenario.name)) continue;
-        // This one writes nothing until the launcher's compiler has translated it.
-        if (all && !std::wcscmp(scenario.name, L"wave64-shader")) continue;
+        // This one writes nothing until the launcher's compiler has translated it,
+        // and mesh-samplers needs its mesh program's translation prepared first.
+        if (all && (!std::wcscmp(scenario.name, L"wave64-shader") || !std::wcsncmp(scenario.name, L"mesh-sampler", 12)))
+            continue;
         const auto name = narrow(scenario.name);
         try {
             auto device = create_scarlett_device(adapter, pci);

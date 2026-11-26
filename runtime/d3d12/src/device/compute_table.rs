@@ -91,7 +91,7 @@ fn literal_samplers(shader: &[u8], stage: u32, signature: &tuxbox_dxbc::rootsig:
     }
 }
 
-fn static_sampler(s: [u32; 13]) -> D3D12_STATIC_SAMPLER_DESC {
+pub(super) fn static_sampler(s: [u32; 13]) -> D3D12_STATIC_SAMPLER_DESC {
     D3D12_STATIC_SAMPLER_DESC {
         Filter: D3D12_FILTER(s[0] as i32),
         AddressU: D3D12_TEXTURE_ADDRESS_MODE(s[1] as i32),

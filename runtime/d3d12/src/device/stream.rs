@@ -226,7 +226,7 @@ unsafe fn create(
         && original[2..7].iter().all(Option::is_none)
         && original[0].is_none()
         && let Some(table) = super::mesh_table::reflected(
-            &device.native, root, mesh, original[1].map(|(pixel, _)| pixel), node_mask,
+            &device.native, root, mesh, original[1].map(|(pixel, _)| pixel), node_mask, &[],
         )?
     {
         unsafe { field.write(table.native.as_raw()) };
@@ -273,6 +273,26 @@ unsafe fn create(
         )
         && shader_cache::prepared(&variant).is_some()
     {
+        rooted[1] = Some(variant);
+    }
+    // The console builds a sampler from literal words, so the title's root need
+    // not hold that state; the translation binds a literal only to a static
+    // sampler with the same state, or, when the program declares one sampler,
+    // to that register whatever its state. Build the mesh table again with the
+    // missing states as private static samplers, as the vertex/pixel roots do,
+    // and keep the root as declared only if the program does not translate then.
+    if original[0].is_none()
+        && let (Some(root), Some((pixel, _)), Some((mesh, _)), Some(field), Some(table)) =
+            (guest_root, original[1], original[7], root_record, pipeline.raster_table.as_ref())
+        && let Ok(signature) = tuxbox_dxbc::rootsig::parse_rts0(table.pixel_root.as_ref().unwrap_or(root).payload())
+        && let Some(samplers) = tuxbox_dxbc::inline_sampler::unmatched(pixel, 0, &signature)
+        && let Ok(Some(extended)) =
+            super::mesh_table::reflected(&device.native, root, mesh, Some(pixel), node_mask, &samplers)
+        && let Some(variant) = extended.pixel_root.as_ref().and_then(|r| shader_cache::raster_with_root(pixel, r.payload()))
+        && shader_cache::prepared(&variant).is_some()
+    {
+        unsafe { field.write(extended.native.as_raw()) };
+        pipeline.raster_table = Some(extended);
         rooted[1] = Some(variant);
     }
     if let Some(root) = guest_root && original[0].is_some() && original[1].is_some()

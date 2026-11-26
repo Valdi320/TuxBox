@@ -11,12 +11,15 @@ use windows::Win32::{
 };
 use windows::core::{Interface, Result};
 
+/// `samplers` are static samplers to append to both the host root and the root
+/// the pixel program is translated against (see `inline_sampler::unmatched`).
 pub(super) fn reflected(
     device: &ID3D12Device,
     original: &RootSource,
     mesh: &[u8],
     pixel: Option<&[u8]>,
     node: u32,
+    samplers: &[[u32; 13]],
 ) -> Result<Option<Arc<ComputeTable>>> {
     let Ok(root) = parse_rts0(original.payload()) else {
         return Ok(None);
@@ -123,6 +126,17 @@ pub(super) fn reflected(
         }
         let mut params = std::slice::from_raw_parts(source.pParameters, root.params.len()).to_vec();
         let originals = params.clone();
+        let mut statics = if source.NumStaticSamplers == 0 {
+            Vec::new()
+        } else {
+            if source.pStaticSamplers.is_null() {
+                return Err(E_INVALIDARG.into());
+            }
+            std::slice::from_raw_parts(source.pStaticSamplers, source.NumStaticSamplers as usize).to_vec()
+        };
+        statics.extend(samplers.iter().copied().map(super::compute_table::static_sampler));
+        desc.Anonymous.Desc_1_1.NumStaticSamplers = statics.len() as u32;
+        desc.Anonymous.Desc_1_1.pStaticSamplers = statics.as_ptr();
         let mut range_storage = vec![Vec::new(); params.len()];
         for (index, change) in layout.replacements {
             let parameter = &mut params[index];
@@ -217,7 +231,7 @@ pub(super) fn reflected(
         };
         // The root the pixel program is translated against: the title's, with
         // those tables as the program reads them.
-        let pixel_root = if pixel_storage.is_empty() {
+        let pixel_root = if pixel_storage.is_empty() && samplers.is_empty() {
             None
         } else {
             let mut for_pixel = originals.clone();
