@@ -337,7 +337,8 @@ pub fn uncovered_descriptor(
     // An embedded root numbers its ranges independently of the shader. A number it gave to
     // another slot is replaced with one of our own.
     if root_declares(root, kind, register, space) {
-        return Some((kind, slot, UNCOVERED_SPACE + table));
+        let private_space = UNCOVERED_SPACE + table;
+        return (!root_declares(root, kind, slot, private_space)).then_some((kind, slot, private_space));
     }
     Some((kind, register, space))
 }
@@ -489,7 +490,14 @@ fn descriptor_class(
     resources: &[[u32; 4]],
 ) -> Option<(u32, u32)> {
     let location = if stage <= 1 && matches!(class, 0x300 | 0x302 | 0x303)
-        && (location >> 8) & 0xff == 9 { 0x800 | (location & 0xff) } else { location };
+        && (location >> 8) & 0xff == 9 { 0x800 | (location & 0xff) }
+        // As in read_bindings, later compute tables use the same resource
+        // encoding as table one. slot_binding separately checks the actual
+        // parameter and SGPR against the independent user-data record.
+        else if stage == 5 && matches!(class, 0x300 | 0x302 | 0x303)
+            && location >> 16 >= 2 && matches!(location & 0xff, 4 | 8) {
+            0x10500 | (location & 0xff)
+        } else { location };
     Some(match (class, location) {
         (0x300, 0x408 | 0x10508) if stage == 5 => (0, 3),
         (0x300 | 0x303, 0x404 | 0x10504) if stage == 5 => {
@@ -553,7 +561,10 @@ fn root_declares(root: &crate::rootsig::RootSig, kind: u32, register: u32, space
                 && register.checked_sub(range.base_register).is_some_and(|delta| delta < range.num)
         }),
         RootParamKind::Descriptor { kind: declared, register: reg, space: sp } => {
-            *declared == kind && *reg == register && *sp == space
+            // Root parameter types (CBV=2, SRV=3, UAV=4) are not
+            // descriptor range types (SRV=0, UAV=1, CBV=2).
+            matches!((*declared, kind), (2, 2) | (3, 0) | (4, 1))
+                && *reg == register && *sp == space
         }
         RootParamKind::Constants { register: reg, space: sp, .. } => {
             kind == 2 && *reg == register && *sp == space
