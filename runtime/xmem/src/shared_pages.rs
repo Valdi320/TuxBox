@@ -5,11 +5,11 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::{ERROR_INVALID_ADDRESS, GetLastError, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
-    MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION,
-    MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, MapViewOfFile3, PAGE_NOACCESS, PAGE_READWRITE,
-    SEC_RESERVE, UnmapViewOfFile, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree,
-    VirtualQuery,
+    CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT, MEM_DECOMMIT,
+    MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
+    MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+    MapViewOfFile3, PAGE_NOACCESS, PAGE_READWRITE, SEC_RESERVE, UnmapViewOfFile, UnmapViewOfFile2,
+    VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualProtect, VirtualQuery,
 };
 use windows_sys::Win32::System::SystemServices::MEM_COALESCE_PLACEHOLDERS;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -190,14 +190,18 @@ pub(super) fn unmap(address: usize) -> Result<(), u32> {
     }
 }
 
-pub(super) fn map_private_range(address: usize, bytes: usize) -> Result<(), u32> {
+pub(super) fn map_private_range_protect(
+    address: usize,
+    bytes: usize,
+    protect: u32,
+) -> Result<(), u32> {
     let view = unsafe {
         VirtualAlloc2(
             GetCurrentProcess(),
             address as _,
             bytes,
             MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
-            PAGE_READWRITE,
+            protect,
             ptr::null_mut(),
             0,
         )
@@ -209,8 +213,45 @@ pub(super) fn map_private_range(address: usize, bytes: usize) -> Result<(), u32>
     }
 }
 
+pub(super) fn map_private_range(address: usize, bytes: usize) -> Result<(), u32> {
+    map_private_range_protect(address, bytes, PAGE_READWRITE)
+}
+
 pub(super) fn unmap_private_range(address: usize, bytes: usize) -> Result<(), u32> {
     if unsafe { VirtualFree(address as _, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) } == 0 {
+        Err(unsafe { GetLastError() })
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn commit_private_range_protect(
+    address: usize,
+    bytes: usize,
+    protect: u32,
+) -> Result<(), u32> {
+    if unsafe { VirtualAlloc(address as _, bytes, MEM_COMMIT, protect) }.is_null() {
+        Err(unsafe { GetLastError() })
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn protect_private_range(
+    address: usize,
+    bytes: usize,
+    protect: u32,
+) -> Result<(), u32> {
+    let mut ignored = 0u32;
+    if unsafe { VirtualProtect(address as _, bytes, protect, &mut ignored) } == 0 {
+        Err(unsafe { GetLastError() })
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn decommit_private_range(address: usize, bytes: usize) -> Result<(), u32> {
+    if unsafe { VirtualFree(address as _, bytes, MEM_DECOMMIT) } == 0 {
         Err(unsafe { GetLastError() })
     } else {
         Ok(())

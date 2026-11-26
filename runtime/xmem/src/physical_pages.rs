@@ -28,10 +28,18 @@ struct Page {
     offset: u64,
     aliases: usize,
     cpu_views: usize,
+    backing_is_cpu: bool,
     has_section_data: bool,
     mapped: bool,
     saved: Vec<u8>,
     backing: PageBacking,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PrivateSpan {
+    pub(super) end: usize,
+    pub(super) mapped: usize,
+    pub(super) deferred: usize,
 }
 
 #[derive(Default)]
@@ -43,7 +51,11 @@ struct Pool {
     // Contiguous token batches share one OS view until a partial unmap.
     views: BTreeMap<usize, usize>,
     // Contiguous private anonymous views for single-CPU-view and GPU-alias pages.
-    private_views: BTreeMap<usize, usize>,
+    private_views: BTreeMap<usize, PrivateSpan>,
+    // Recorded aperture kinds (`true` = CPU-intended reservation via XMemVirtualAlloc).
+    aperture_kinds: BTreeMap<usize, (usize, bool)>,
+    // Secondary views left `PAGE_NOACCESS` until a CPU fault promotes to `SharedSection`.
+    secondary_aliases: HashSet<usize>,
     // Only split apertures with live views are retained. An empty original
     // reservation is coalesced and may be released directly by the guest.
     apertures: BTreeMap<usize, (usize, usize)>,
@@ -71,6 +83,23 @@ fn available_memory() -> Result<u64, u32> {
 
 pub(super) fn relinquished() -> u64 {
     RETURNED_TO_SYSTEM.load(Ordering::Acquire)
+}
+
+pub(super) fn record_aperture_kind(base: usize, bytes: usize, is_cpu: bool) {
+    let Some(end) = base.checked_add(bytes) else {
+        return;
+    };
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let overlapping: Vec<usize> = pool
+        .aperture_kinds
+        .iter()
+        .filter(|&(&lo, &(hi, _))| lo < end && base < hi)
+        .map(|(&lo, _)| lo)
+        .collect();
+    for lo in overlapping {
+        pool.aperture_kinds.remove(&lo);
+    }
+    pool.aperture_kinds.insert(base, (end, is_cpu));
 }
 
 /// 64 KiB guest page tokens draw on sixteen ordinary host pages each.
@@ -136,6 +165,7 @@ impl Pool {
                     mapped: false,
                     aliases: 0,
                     cpu_views: 0,
+                    backing_is_cpu: false,
                     saved: Vec::new(),
                     offset: (token - first) * PAGE as u64,
                     section: Arc::clone(&section),
@@ -169,9 +199,24 @@ impl Pool {
         (address - base < bytes).then_some((base, bytes))
     }
 
+    pub(super) fn private_span(&self, at: usize) -> Option<(usize, PrivateSpan)> {
+        let (&lo, &span) = self.private_views.range(..=at).next_back()?;
+        (at < span.end).then_some((lo, span))
+    }
+
+    pub(super) fn is_cpu_aperture(&self, at: usize) -> bool {
+        let Some((&_lo, &(hi, is_cpu))) = self.aperture_kinds.range(..=at).next_back() else {
+            return false;
+        };
+        at < hi && is_cpu
+    }
+
     // Try the placeholder operations themselves. This avoids keeping records
     // for empty apertures which games can release with plain VirtualFree.
     fn map_shared_page(&mut self, at: usize, token: u64) -> Result<bool, u32> {
+        if self.private_span(at).is_some() {
+            self.detach_private_slot(at, true)?;
+        }
         let existing = self.aperture(at);
         let info = shared_pages::region(at)?;
         if info.State != MEM_RESERVE
@@ -333,10 +378,6 @@ impl Pool {
     fn map_cpu_page(&mut self, at: usize, token: u64) -> Result<bool, u32> {
         match self.pages[&token].backing {
             PageBacking::SharedSection => self.map_shared_page(at, token),
-            PageBacking::PrivateView(_) if self.pages[&token].cpu_views >= 1 => {
-                self.promote_to_section(token)?;
-                self.map_shared_page(at, token)
-            }
             _ => self.map_private_page(at, token, false),
         }
     }
@@ -366,7 +407,7 @@ impl Pool {
                 if !matches!(result, Ok(true)) {
                     for prior in (0..i).rev() {
                         let prev = address + prior * PAGE;
-                        if self.private_views.range(..=prev).next_back().is_some_and(|(_, &hi)| prev < hi) {
+                        if self.private_span(prev).is_some() {
                             let _ = self.unmap_private_view_range(prev, PAGE, true);
                         } else {
                             let _ = self.unmap_shared_page(prev);
@@ -467,11 +508,7 @@ impl Pool {
                 .try_reserve_exact(bytes / PAGE)
                 .map_err(|_| ERROR_NOT_ENOUGH_MEMORY)?;
             for at in (address..address + bytes).step_by(PAGE) {
-                let was_private = self
-                    .private_views
-                    .range(..=at)
-                    .next_back()
-                    .is_some_and(|(_, &hi)| at < hi);
+                let was_private = self.private_span(at).is_some();
                 entries.push((at, *self.mappings.get(&at).ok_or(ERROR_INVALID_ADDRESS)?, was_private));
             }
             for (i, &(at, _, was_private)) in entries.iter().enumerate() {
@@ -624,9 +661,8 @@ pub unsafe extern "system" fn allocate(flags: u64, count: *mut usize, tokens: *m
         return failure(ERROR_INVALID_PARAMETER);
     }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let first = match pool.allocate(requested) {
-        Ok(first) => first,
-        Err(e) => return failure(e),
+    let Ok(first) = pool.allocate(requested) else {
+        return failure(ERROR_NOT_ENOUGH_MEMORY);
     };
     for i in 0..requested {
         // SAFETY: caller provided requested entries.
@@ -690,10 +726,8 @@ pub unsafe extern "system" fn free(count: usize, tokens: *const u64) -> i32 {
         while first < mapped.len() {
             let start = mapped[first].0;
             let mut last = first + 1;
-            let result = if let Some((_, &limit)) = pool.private_views.range(..=start).next_back()
-                && start < limit
-            {
-                while last < mapped.len() && mapped[last].0 < limit
+            let result = if let Some((_, span)) = pool.private_span(start) {
+                while last < mapped.len() && mapped[last].0 < span.end
                     && mapped[last].0 == mapped[last - 1].0 + PAGE {
                     last += 1;
                 }

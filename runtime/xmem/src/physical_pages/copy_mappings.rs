@@ -46,11 +46,7 @@ impl Pool {
         if previous == token {
             return Ok(());
         }
-        let in_private = self
-            .private_views
-            .range(..=at)
-            .next_back()
-            .is_some_and(|(_, &hi)| at < hi);
+        let in_private = self.private_span(at).is_some();
         if previous.is_some()
             && let Some(new_token) = token
             && in_private
@@ -235,7 +231,10 @@ impl Pool {
                 if !self.gpu_aliases.contains(&entry.at) && entry.old != entry.new {
                     return Err(ERROR_INVALID_ADDRESS);
                 }
-            } else if !reserved.contains(&entry.at) {
+            } else if self.private_span(entry.at).is_none()
+                && !self.deferred_unmaps.contains_key(&entry.at)
+                && !reserved.contains(&entry.at)
+            {
                 let area = shared_pages::region(entry.at)?;
                 if area.State != MEM_RESERVE || area.AllocationProtect != PAGE_NOACCESS {
                     return Err(ERROR_INVALID_ADDRESS);
@@ -260,7 +259,7 @@ pub(super) unsafe extern "system" fn copy_page_mappings(
 ) -> i32 {
     let result = unsafe {
         array(batches, count).and_then(|batches| {
-            let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pool = super::POOL.lock().unwrap_or_else(|e| e.into_inner());
             let updates = pool.plan_batch(batches, source, pages)?;
             pool.update_aliases(&updates)
         })

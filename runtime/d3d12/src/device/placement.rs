@@ -14,7 +14,6 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use tuxbox_xg_layout::{Desc, Plane};
 use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER};
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::System::{Diagnostics::Debug::ReadProcessMemory, Threading::GetCurrentProcess};
 use windows::core::{HRESULT, Result};
 
 pub(crate) fn supported_state(state: D3D12_RESOURCE_STATES, flags: D3D12_RESOURCE_FLAGS) -> bool {
@@ -328,22 +327,11 @@ impl Texture {
         let size = (mip.source.end - mip.source.start) as usize;
         output.clear();
         output.try_reserve_exact(size).map_err(|_| E_OUTOFMEMORY)?;
-        let mut copied = 0;
-        // SAFETY: the OS checks the guest mapping. A partial transfer never
-        // exposes uninitialized bytes, including when pages are decommitted.
-        let result = unsafe {
-            ReadProcessMemory(
-                GetCurrentProcess(),
-                (self.address + mip.source.start) as *const _,
-                output.as_mut_ptr().cast(),
-                size,
-                Some(&mut copied),
-            )
-        };
-        if result.is_err() || copied != size {
+        output.resize(size, 0);
+        if !super::heap::backing::read_guest_bytes(self.address + mip.source.start, output) {
+            output.clear();
             return Ok(false);
         }
-        unsafe { output.set_len(size) };
         Ok(true)
     }
 

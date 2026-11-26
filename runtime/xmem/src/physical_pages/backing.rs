@@ -1,5 +1,5 @@
 //! Private anonymous physical backings and lifetime holds for zero-copy GPU imports (#191).
-use super::{PAGE, POOL, Pool, shared_pages};
+use super::{PAGE, Pool, shared_pages};
 use core::ptr;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -232,10 +232,12 @@ impl Pool {
         if self.deferred_unmaps.is_empty() || released_vas.is_empty() {
             return;
         }
-        let mut spans_to_clean: HashMap<usize, usize> = HashMap::new();
         let mut section_spans_to_clean: HashMap<usize, usize> = HashMap::new();
         let mut legacy_or_single = Vec::new();
         for &va in released_vas {
+            if self.view_holds.contains_key(&va) {
+                continue;
+            }
             let Some(&kind) = self.deferred_unmaps.get(&va) else {
                 continue;
             };
@@ -251,10 +253,23 @@ impl Pool {
                     }
                 }
                 DeferredKind::PrivatePlaceholder => {
-                    if let Some((&lo, &hi)) = self.private_views.range(..=va).next_back()
-                        && va < hi
-                    {
-                        spans_to_clean.insert(lo, hi);
+                    if let Some((lo, mut span)) = self.private_span(va) {
+                        self.deferred_unmaps.remove(&va);
+                        span.deferred -= 1;
+                        if span.mapped == 0 && span.deferred == 0 && !self.has_hold(lo, span.end) {
+                            if let Some((base, extent)) = self.aperture(lo)
+                                && shared_pages::unmap_private_range(lo, span.end - lo).is_ok()
+                            {
+                                self.private_views.remove(&lo);
+                                self.release_aperture_pages(base, extent, (span.end - lo) / PAGE);
+                            } else {
+                                self.private_views.insert(lo, span);
+                            }
+                        } else if shared_pages::decommit_private_range(va, PAGE).is_ok() {
+                            self.private_views.insert(lo, span);
+                        } else {
+                            self.deferred_unmaps.insert(va, kind);
+                        }
                     }
                 }
             }
@@ -286,12 +301,6 @@ impl Pool {
             }
             self.reconcile_deferred_section_span(lo, hi);
         }
-        for (lo, hi) in spans_to_clean {
-            if self.has_hold(lo, hi) {
-                continue;
-            }
-            self.reconcile_deferred_private_span(lo, hi);
-        }
     }
 
     pub(super) fn release_aperture_pages(&mut self, base: usize, extent: usize, count: usize) {
@@ -305,53 +314,6 @@ impl Pool {
             } else {
                 entry.1 -= count;
             }
-        }
-    }
-
-    fn reconcile_deferred_private_span(&mut self, lo: usize, hi: usize) {
-        let Some((base, extent)) = self.aperture(lo) else {
-            return;
-        };
-        let live_runs = self.collect_live_runs(lo, hi);
-        if live_runs.is_empty() {
-            if shared_pages::unmap_private_range(lo, hi - lo).is_ok() {
-                for va in (lo..hi).step_by(PAGE) {
-                    self.deferred_unmaps.remove(&va);
-                }
-                self.private_views.remove(&lo);
-                self.release_aperture_pages(base, extent, (hi - lo) / PAGE);
-            }
-            return;
-        }
-        let mut snapshots = Vec::new();
-        for &(r_lo, r_hi) in &live_runs {
-            let len = r_hi - r_lo;
-            let mut buf = vec![0u8; len];
-            // SAFETY: every page in `r_lo..r_hi` is currently committed `PAGE_READWRITE`.
-            unsafe { ptr::copy_nonoverlapping(r_lo as *const u8, buf.as_mut_ptr(), len) };
-            snapshots.push((r_lo, r_hi, buf));
-        }
-        if shared_pages::unmap_private_range(lo, hi - lo).is_err() {
-            return;
-        }
-        for va in (lo..hi).step_by(PAGE) {
-            self.deferred_unmaps.remove(&va);
-        }
-        self.private_views.remove(&lo);
-        let mut restored_pages = 0usize;
-        for (r_lo, r_hi, buf) in snapshots {
-            if let Ok(info) = shared_pages::region(r_lo)
-                && shared_pages::isolate_range(r_lo, r_hi - r_lo, &info).is_ok()
-                && shared_pages::map_private_range(r_lo, r_hi - r_lo).is_ok()
-            {
-                unsafe { ptr::copy_nonoverlapping(buf.as_ptr(), r_lo as *mut u8, r_hi - r_lo) };
-                self.private_views.insert(r_lo, r_hi);
-                restored_pages += (r_hi - r_lo) / PAGE;
-            }
-        }
-        let dropped = (hi - lo) / PAGE - restored_pages;
-        if dropped > 0 {
-            self.release_aperture_pages(base, extent, dropped);
         }
     }
 
@@ -401,7 +363,7 @@ impl Pool {
         }
     }
 
-    fn collect_live_runs(&self, lo: usize, hi: usize) -> Vec<(usize, usize)> {
+    pub(super) fn collect_live_runs(&self, lo: usize, hi: usize) -> Vec<(usize, usize)> {
         let mut runs = Vec::new();
         let mut cur_start: Option<usize> = None;
         for va in (lo..hi).step_by(PAGE) {
@@ -436,7 +398,7 @@ pub unsafe extern "system" fn acquire_physical_backing(
     let (Ok(addr), Ok(len)) = (usize::try_from(address), usize::try_from(bytes)) else {
         return failure(ERROR_INVALID_PARAMETER);
     };
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pool = super::POOL.lock().unwrap_or_else(|e| e.into_inner());
     let (runs, record) = match pool.resolve_backings(addr, len) {
         Ok(ok) => ok,
         Err(error) => return failure(error),
@@ -475,7 +437,7 @@ pub unsafe extern "system" fn acquire_physical_backing_runs(
     let (Ok(addr), Ok(len)) = (usize::try_from(address), usize::try_from(bytes)) else {
         return failure(ERROR_INVALID_PARAMETER);
     };
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pool = super::POOL.lock().unwrap_or_else(|e| e.into_inner());
     let (resolved, record) = match pool.resolve_backings(addr, len) {
         Ok(ok) => ok,
         Err(error) => return failure(error),
@@ -508,7 +470,7 @@ pub extern "system" fn release_physical_backing(hold: u64) {
         return;
     }
     let arenas = {
-        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pool = super::POOL.lock().unwrap_or_else(|e| e.into_inner());
         pool.release_hold(hold)
     };
     drop(arenas);

@@ -212,6 +212,11 @@ fn mapping_second_cpu_view_promotes_token_from_private_to_shared_section() {
     unsafe { a.cast::<u32>().write(0xdead_beef) };
 
     assert_eq!(unsafe { map(b, 1, &token) }, b);
+    // Mapping a second CPU view must stay MEM_PRIVATE (PAGE_NOACCESS secondary alias)
+    // until a CPU access on `b` triggers the VEH to lazily promote to SharedSection.
+    assert_eq!(query(a.addr()).Type, MEM_PRIVATE);
+    assert_eq!(query(b.addr()).State, M_COMMIT);
+    assert_eq!(query(b.addr()).Protect, PAGE_NOACCESS);
     assert_eq!(unsafe { b.cast::<u32>().read() }, 0xdead_beef);
     unsafe { b.cast::<u32>().write(0xcafe_babe) };
     assert_eq!(unsafe { a.cast::<u32>().read() }, 0xcafe_babe);
@@ -223,4 +228,175 @@ fn mapping_second_cpu_view_promotes_token_from_private_to_shared_section() {
     assert_eq!(unsafe { free(1, &token) }, 1);
     assert_ne!(unsafe { VirtualFree(a, 0, MEM_RELEASE) }, 0);
     assert_ne!(unsafe { VirtualFree(b, 0, MEM_RELEASE) }, 0);
+}
+
+#[test]
+fn partial_unmap_of_contiguous_private_span_preserves_live_siblings_and_holds() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut tokens = [0u64; 4];
+    let mut count = 4usize;
+    assert_eq!(unsafe { allocate(super::super::FLAGS, &mut count, tokens.as_mut_ptr()) }, 1);
+    let aperture = reserve_aperture(4);
+    assert!(!aperture.is_null());
+    assert_eq!(unsafe { map(aperture, 4, tokens.as_ptr()) }, aperture);
+
+    let p0 = aperture.addr();
+    let p1 = p0 + PAGE;
+    let p2 = p0 + 2 * PAGE;
+    let p3 = p0 + 3 * PAGE;
+    unsafe {
+        (p0 as *mut u32).write(0x1111_2222);
+        (p1 as *mut u32).write(0x3333_4444);
+        (p2 as *mut u32).write(0x5555_6666);
+        (p3 as *mut u32).write(0x7777_8888);
+    }
+
+    let (mut addr, mut hold) = (0u64, 0u64);
+    assert_eq!(unsafe { acquire_physical_backing(p0 as u64, PAGE as u64, &mut addr, &mut hold) }, 1);
+    assert_eq!(addr, p0 as u64);
+
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let reader_stop = std::sync::Arc::clone(&stop);
+    let reader = std::thread::spawn(move || {
+        while !reader_stop.load(Ordering::Acquire) {
+            unsafe {
+                assert_eq!((p0 as *const u32).read_volatile(), 0x1111_2222);
+                assert_eq!((p2 as *const u32).read_volatile(), 0x5555_6666);
+            }
+        }
+    });
+
+    // Unmapping p1 must decommit p1 immediately despite p0's hold, without touching p0/p2/p3.
+    assert_eq!(unsafe { map(p1 as *mut c_void, 1, ptr::null()) }, p1 as *mut c_void);
+    assert_eq!(query(p1).State, M_RESERVE);
+    assert_eq!(query(p0).State, M_COMMIT);
+    assert_eq!(query(p2).State, M_COMMIT);
+    assert_eq!(query(p3).State, M_COMMIT);
+
+    // Remapping p1 commits only p1 back in place and restores its saved contents.
+    assert_eq!(unsafe { map(p1 as *mut c_void, 1, &tokens[1]) }, p1 as *mut c_void);
+    assert_eq!(query(p1).State, M_COMMIT);
+    assert_eq!(unsafe { (p1 as *const u32).read() }, 0x3333_4444);
+
+    // Unmapping p3 and held p0 keeps p0 committed while reader keeps reading p0/p2.
+    assert_eq!(unsafe { map(p3 as *mut c_void, 1, ptr::null()) }, p3 as *mut c_void);
+    assert_eq!(unsafe { map(p0 as *mut c_void, 1, ptr::null()) }, p0 as *mut c_void);
+    assert_eq!(query(p3).State, M_RESERVE);
+    assert_eq!(query(p0).State, M_COMMIT);
+
+    stop.store(true, Ordering::Release);
+    reader.join().unwrap();
+
+    // Unmap remaining live siblings p1..=p2, then release p0's hold so the whole span collapses.
+    assert_eq!(unsafe { map(p1 as *mut c_void, 2, ptr::null()) }, p1 as *mut c_void);
+    assert_eq!(query(p0).State, M_COMMIT);
+    release_physical_backing(hold);
+
+    let final_info = query(p0);
+    assert_eq!(final_info.State, M_RESERVE);
+    assert_eq!(final_info.AllocationProtect, PAGE_NOACCESS);
+    assert_eq!(unsafe { free(4, tokens.as_ptr()) }, 1);
+    assert_ne!(unsafe { VirtualFree(aperture, 0, MEM_RELEASE) }, 0);
+}
+
+#[test]
+fn copy_page_mappings_can_unmap_and_remap_inside_contiguous_private_span() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut tokens = [0u64; 3];
+    let mut count = 3usize;
+    assert_eq!(unsafe { allocate(super::super::FLAGS, &mut count, tokens.as_mut_ptr()) }, 1);
+    let cpu = reserve_aperture(3);
+    let gpu = reserve_aperture(3);
+    assert_eq!(unsafe { map(cpu, 3, tokens.as_ptr()) }, cpu);
+    for (i, word) in [0xaaaa_1111u32, 0xbbbb_2222, 0xcccc_3333].into_iter().enumerate() {
+        unsafe { cpu.cast::<u8>().add(i * PAGE).cast::<u32>().write(word) };
+    }
+
+    // Batch-map 3 contiguous GPU alias pages into one PrivateSpan.
+    let map_all = PageRange { mode: 0, source: 0, count: 3 };
+    let batch_all = Batch { destination: gpu.addr(), count: 1, ranges: &map_all };
+    assert_eq!(unsafe { copy_page_mappings(1, &batch_all, cpu.addr(), 3) }, 0);
+
+    // Unmap the middle GPU alias page (mode 2 = unmap), decommitting page 1 only.
+    let unmap_mid = PageRange { mode: 2, source: 0, count: 1 };
+    let batch_unmap = Batch { destination: gpu.addr() + PAGE, count: 1, ranges: &unmap_mid };
+    assert_eq!(unsafe { copy_page_mappings(1, &batch_unmap, cpu.addr(), 3) }, 0);
+    assert_eq!(query(gpu.addr() + PAGE).State, M_RESERVE);
+    assert_eq!(query(gpu.addr()).State, M_COMMIT);
+    assert_eq!(query(gpu.addr() + 2 * PAGE).State, M_COMMIT);
+
+    // Remap page 1 back into the decommitted PrivateSpan hole (old=None, AllocationProtect=PAGE_READWRITE).
+    let remap_mid = PageRange { mode: 0, source: 2, count: 1 };
+    let batch_remap = Batch { destination: gpu.addr() + PAGE, count: 1, ranges: &remap_mid };
+    assert_eq!(unsafe { copy_page_mappings(1, &batch_remap, cpu.addr(), 3) }, 0);
+    assert_eq!(query(gpu.addr() + PAGE).State, M_COMMIT);
+    assert_eq!(unsafe { gpu.cast::<u8>().add(PAGE).cast::<u32>().read() }, 0xcccc_3333);
+
+    // Unmap all GPU aliases and CPU views and release apertures cleanly.
+    let unmap_all = PageRange { mode: 2, source: 0, count: 3 };
+    let batch_clear = Batch { destination: gpu.addr(), count: 1, ranges: &unmap_all };
+    assert_eq!(unsafe { copy_page_mappings(1, &batch_clear, cpu.addr(), 3) }, 0);
+    assert_eq!(unsafe { map(cpu, 3, ptr::null()) }, cpu);
+    assert_eq!(unsafe { free(3, tokens.as_ptr()) }, 1);
+    assert_ne!(unsafe { VirtualFree(cpu, 0, MEM_RELEASE) }, 0);
+    assert_ne!(unsafe { VirtualFree(gpu, 0, MEM_RELEASE) }, 0);
+}
+
+#[test]
+fn gpu_pool_then_plain_cpu_view_upgrades_backing_and_keeps_mem_private() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut tokens = [0u64; 4];
+    let mut count = 4usize;
+    assert_eq!(unsafe { allocate(super::super::FLAGS, &mut count, tokens.as_mut_ptr()) }, 1);
+
+    let gpu_pool = reserve_aperture(4);
+    let cpu_view = unsafe { virtual_alloc(ptr::null_mut(), 4 * PAGE, 0x2040_2000, 0x21, PAGE_READWRITE) };
+    let gpu_alias2 = reserve_aperture(4);
+    assert!(!gpu_pool.is_null() && !cpu_view.is_null() && !gpu_alias2.is_null());
+
+    // 1. Map into (0x23, 0x2404) GPU pool first -> canonical MEM_PRIVATE backing starts there.
+    assert_eq!(unsafe { map(gpu_pool, 4, tokens.as_ptr()) }, gpu_pool);
+    assert_eq!(query(gpu_pool.addr()).Type, MEM_PRIVATE);
+    assert_eq!(query(gpu_pool.addr()).Protect, PAGE_READWRITE);
+
+    // 2. Map into (0x21, PAGE_READWRITE) CPU view -> upgrades canonical backing to cpu_view
+    // and demotes gpu_pool to PAGE_NOACCESS without promoting to SharedSection.
+    assert_eq!(unsafe { map(cpu_view, 4, tokens.as_ptr()) }, cpu_view);
+    assert_eq!(query(cpu_view.addr()).Type, MEM_PRIVATE);
+    assert_eq!(query(cpu_view.addr()).Protect, PAGE_READWRITE);
+    assert_eq!(query(gpu_pool.addr()).State, M_COMMIT);
+    assert_eq!(query(gpu_pool.addr()).Protect, PAGE_NOACCESS);
+
+    // 3. Map into 2nd GPU alias -> secondary PAGE_NOACCESS view, cpu_view stays MEM_PRIVATE.
+    assert_eq!(unsafe { map(gpu_alias2, 4, tokens.as_ptr()) }, gpu_alias2);
+    assert_eq!(query(gpu_alias2.addr()).State, M_COMMIT);
+    assert_eq!(query(gpu_alias2.addr()).Protect, PAGE_NOACCESS);
+    assert_eq!(query(cpu_view.addr()).Type, MEM_PRIVATE);
+
+    unsafe { cpu_view.cast::<u32>().write(0x5a5a_c3c3) };
+    assert_eq!(query(cpu_view.addr()).Type, MEM_PRIVATE);
+
+    let (mut b1, mut h1) = (0u64, 0u64);
+    let (mut b2, mut h2) = (0u64, 0u64);
+    let (mut b3, mut h3) = (0u64, 0u64);
+    assert_eq!(unsafe { acquire_physical_backing(gpu_pool.addr() as u64, (4 * PAGE) as u64, &mut b1, &mut h1) }, 1);
+    assert_eq!(unsafe { acquire_physical_backing(cpu_view.addr() as u64, (4 * PAGE) as u64, &mut b2, &mut h2) }, 1);
+    assert_eq!(unsafe { acquire_physical_backing(gpu_alias2.addr() as u64, (4 * PAGE) as u64, &mut b3, &mut h3) }, 1);
+    assert_eq!(b1, cpu_view.addr() as u64);
+    assert_eq!(b2, cpu_view.addr() as u64);
+    assert_eq!(b3, cpu_view.addr() as u64);
+
+    release_physical_backing(h1);
+    release_physical_backing(h2);
+    release_physical_backing(h3);
+
+    assert_eq!(unsafe { map(gpu_pool, 4, ptr::null()) }, gpu_pool);
+    assert_eq!(unsafe { map(cpu_view, 4, ptr::null()) }, cpu_view);
+    assert_eq!(unsafe { map(gpu_alias2, 4, ptr::null()) }, gpu_alias2);
+    assert_eq!(unsafe { free(4, tokens.as_ptr()) }, 1);
+    assert_ne!(unsafe { VirtualFree(gpu_pool, 0, MEM_RELEASE) }, 0);
+    assert_ne!(unsafe { VirtualFree(cpu_view, 0, MEM_RELEASE) }, 0);
+    assert_ne!(unsafe { VirtualFree(gpu_alias2, 0, MEM_RELEASE) }, 0);
 }
