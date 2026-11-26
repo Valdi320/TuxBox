@@ -150,6 +150,20 @@ class CompareScarlett(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             with self.assertRaises(ValueError): snapshot_request(source,Path(tmp))
 
+    def test_wave32_snapshot_preserves_variant_and_verifies_base_digest(self):
+        import hashlib
+        data = b"synthetic console shader"
+        with TemporaryDirectory() as source_dir, TemporaryDirectory() as dest_dir:
+            source = Path(source_dir) / (hashlib.sha256(data).hexdigest() + "_w32.wave32")
+            source.write_bytes(data)
+            snap = snapshot_request(source, Path(dest_dir))
+            self.assertEqual(snap.name, source.name)
+            self.assertEqual(snap.read_bytes(), data)
+            source.write_bytes(b"changed")
+            self.assertEqual(snap.read_bytes(), data)
+            with self.assertRaises(ValueError):
+                snapshot_request(source, Path(dest_dir))
+
     def test_stencil_and_link_snapshot_all_three_inputs(self):
         data=b"producer";pixel=b"pixel"
         bitcode=b"BC\xc0\xde"
