@@ -222,8 +222,12 @@ unsafe fn create_pipeline_x_inner(
             // Embedded RTS0 cannot be replaced. The translator reads that original
             // root and fills only the slots the appended signature adds.
             let mut table = table;
+            // The paged bindless root adds tb_heap_map. A translation that
+            // was prepared without that root can use unmapped guest indices.
             let mut code = super::shader_cache::compute_with_root(bytes, table.layout.payload())
-                .or_else(|| super::shader_cache::prepared(bytes));
+                .or_else(|| {
+                    if table.index_map.is_some() { None } else { super::shader_cache::prepared(bytes) }
+                });
             // A heap-indexed IDXEN access needs each slot's buffer stride: retry
             // on the same root with the arena's stride table appended.
             if code.is_none() && super::shader_cache::refused_for_heap_strides(bytes, table.layout.payload())

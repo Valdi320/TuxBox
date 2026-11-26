@@ -171,3 +171,5 @@ all other guard words must match; stand-ins are disabled.
 ```sh
 python tuxbox.py verify --only lanes-compute-root-recovery --output build/lanes-compute-root-recovery.json
 ```
+
+The optional `lanes-bindless-compute` verification suite runs the same native console shader with a roomy and constrained paged resource heap (logical slot 80, resident limit 64 in the constrained run). Both readbacks verify the full output and guard words; it requires fresh root-aware translation, the paged map bind and disabled stand-ins.

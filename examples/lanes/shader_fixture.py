@@ -115,6 +115,26 @@ def recovered_root_shader():
     return stage_container(0x50060, image(7, first + second, user, used), [(b"PSV0", psv)])
 
 
+BINDLESS_INDEX = 80
+BINDLESS_EXPECTED = 0x7AB1E002
+
+
+def bindless_compute_shader():
+    """Direct-indexed raw UAV store at a guest index outside the paged limit."""
+    code = [0xbe8403ff, BINDLESS_INDEX, 0x8f048504,
+            0xf4080205, 0x08000000, 0xbf8cc07f,
+            0x7e0002ff, BINDLESS_EXPECTED, 0xe0700000, 0x80020000, 0xbf810000]
+    info = bytearray(48)
+    info[24] = 5
+    struct.pack_into("<3I", info, 36, 64, 1, 1)
+    root = pack([2, 0, 24, 0, 24, 0x400])
+    return stage_container(0x50066, image(7, code, [(5, 0, 1, 0, 10)]), [
+        (b"SFI0", struct.pack("<Q", 1 << 25)),
+        (b"PSV0", pack([48]) + info + pack([0])),
+        (b"RTS0", root),
+    ])
+
+
 def declaration(name, data):
     values = ",".join(str(byte) for byte in data)
     return (f"constexpr unsigned char {name}[] = {{{values}}};\n"
@@ -128,6 +148,8 @@ def header():
             + declaration("xbox_shader", shader()) + declaration("wave_shader", wave_shader())
             + f"constexpr unsigned wave_shader_expected[] = {{{words}}};\n"
             + declaration("recovered_root_shader", recovered_root_shader())
+            + declaration("bindless_compute_shader", bindless_compute_shader())
+            + f"constexpr unsigned bindless_index = {BINDLESS_INDEX};\nconstexpr unsigned bindless_expected = {BINDLESS_EXPECTED:#x};\n"
             + declaration("root_shader", root_shader(0x40)) + declaration("root_refused_shader", root_shader(0xA0))
             + f"constexpr unsigned root_shader_expected = {ROOT_EXPECTED:#x};\n")
 

@@ -26,7 +26,7 @@ BASE_SUITES = ("cpu", "xmem", "xapu", "xgameruntime", "xcrdapi", "graphics", "gr
                "d3d12-heaps", "d3d12-placement", "d3d12-copy-resource", "d3d12-draw", "d3d12-stream", "d3d12-frame-events",
                "d3d12-guids", "d3d12-signatures", "xg-provider")
 OPTIONAL_PROVIDERS = {"dxc-utils": "dxc-utils/dxcompiler.dll", "xg": "xg/xg_xs.dll"}
-SUITES = (*BASE_SUITES, "d3d12-mesh", *OPTIONAL_PROVIDERS)
+SUITES = (*BASE_SUITES, "d3d12-mesh", "lanes-bindless-compute", *OPTIONAL_PROVIDERS)
 # The scenarios of `lanes.exe --selftest`, one gate each.
 LANES_SCENARIOS = ("labels", "cross-queue", "compute-frame", "skipped-command", "copy-memory", "shared-texture",
                    "indirect-dispatch", "gpu-indirect-dispatch",
@@ -474,6 +474,59 @@ def lanes_compute_root(host, check, gpu_args, pci, memory_symbols):
                   config="lanes/MicrosoftGame.config", device_factory="xbox", log_check=expect_root_translations)
     finally:
         forget(rootless | requested("Compiled Xbox shader ") | requested("Xbox shader "))
+        for name, value in saved.items():
+            if value is None:
+                host.env.pop(name, None)
+            else:
+                host.env[name] = value
+
+
+def lanes_bindless_compute(host, check, gpu_args, pci, memory_symbols):
+    from examples.lanes.shader_fixture import bindless_compute_shader
+    from .runtime_shaders import shader_session
+    from .shader_prep import SOURCE_CACHE
+
+    sources = Path(host.env["WINEPREFIX"]) / SOURCE_CACHE
+    original = hashlib.sha256(bindless_compute_shader()).hexdigest()
+    names = ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_SHADER_SESSION",
+             "TUXBOX_DESCRIPTOR_HEAP_LIMIT", "TUXBOX_NULL_PIPELINES")
+    saved = {name: host.env.get(name) for name in names}
+    try:
+        for kind, limit in (("wide", "1000000"), ("constrained", "64")):
+            messages = []
+            host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr",
+                            TUXBOX_DESCRIPTOR_HEAP_LIMIT=limit, TUXBOX_NULL_PIPELINES="0")
+            host.env.pop("TUXBOX_SHADER_SESSION", None)
+            def keys():
+                return {m[1] for line in messages if (m := re.match(r"Compiled Xbox shader ([0-9a-f]{64})", line))}
+            def clean(entries):
+                for key in entries:
+                    for path in [*sources.glob(f"{key}.*"), *sources.parent.glob(f"runtime/*/{key}.*")]:
+                        path.unlink()
+            def receipt(output):
+                compiled = keys()
+                loaded = set(re.findall(r"prepared compute shader loaded, source SHA-256 ([0-9a-f]{64})", output))
+                if original in compiled or not compiled or loaded != compiled:
+                    return "expected fresh root-aware worker translation matching loaded digest"
+                # Scarlett device11_queue always uses an arena even when its
+                # descriptor count fits. Both trials must bind the paged map.
+                if "bound paged resource descriptor index map" not in output:
+                    return "missing paged resource map bind"
+                if "substituted null " in output:
+                    return "bindless compute used a stand-in"
+                return None
+            try:
+                clean({original})
+                with shader_session(sources.parent, host.env, messages.append):
+                    check(f"lanes-bindless-compute-{kind}", "lanes/lanes.exe",
+                          ["--selftest", "bindless-compute", *gpu_args, "--report"],
+                          rf"lanes-selftest PASS pci={pci} scenario=bindless-compute passed=1",
+                          providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
+                                     "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
+                          config="lanes/MicrosoftGame.config", device_factory="xbox", log_check=receipt)
+            finally:
+                clean({original} | keys())
+    finally:
         for name, value in saved.items():
             if value is None:
                 host.env.pop(name, None)
@@ -970,6 +1023,8 @@ def verify(host, output, adapter, selected=None, samples=1):
             lanes_raster_tables(host, check, gpu_args, pci, memory_symbols)
         if "lanes-compute-root" in selected and host.backend == "proton":
             lanes_compute_root(host, check, gpu_args, pci, memory_symbols)
+        if "lanes-bindless-compute" in selected and host.backend == "proton":
+            lanes_bindless_compute(host, check, gpu_args, pci, memory_symbols)
         if "lanes-compute-root-recovery" in selected and host.backend == "proton":
             lanes_compute_root_recovery(host, check, gpu_args, pci, memory_symbols)
         if "cpu-benchmark" in selected:

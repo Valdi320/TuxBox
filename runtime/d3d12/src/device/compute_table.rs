@@ -184,7 +184,21 @@ fn reflected_root(
     // The user-data layout confirmed every compute binding against this root.
     let mut verified_compute = false;
     let mut recovered_samplers = Vec::new();
+    // The index map's root SRV is read by every stage of a compute root, only by
+    // the pixel stage of a raster one.
+    let mut index_map_visibility = D3D12_SHADER_VISIBILITY_PIXEL;
     let bindings = match (&program, signature.params.as_slice()) {
+        // A bindless root: no tables, only constants and root descriptors, with
+        // CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED. The program picks descriptors by heap
+        // index, so it needs no table layout, only the guest-to-host index map
+        // once descriptors are paged.
+        (Program::Compute(shader), _) if bindless_compute_root(&signature) => {
+            // Compute never reads the scalar word; it only marks the map.
+            scalar_index = Some((0, 0));
+            index_map_visibility = D3D12_SHADER_VISIBILITY_ALL;
+            recovered_samplers = literal_samplers(shader, 5, &signature);
+            Some(Vec::new())
+        }
         (Program::Compute(shader), params) => {
             let tables = match params {
                 [tables @ .., last] if matches!(last.kind, RootParamKind::Constants { num32: 1..=4, .. }) => tables,
@@ -379,11 +393,18 @@ fn reflected_root(
         let reader = reader.ok_or(E_POINTER)?;
         let mut desc = *reader.GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1)?;
         let source = desc.Anonymous.Desc_1_1;
-        if source.NumParameters as usize != signature.params.len() || source.pParameters.is_null() {
+        if source.NumParameters as usize != signature.params.len()
+            || (source.NumParameters != 0 && source.pParameters.is_null())
+        {
             return Err(E_INVALIDARG.into());
         }
-        let mut parameters =
-            std::slice::from_raw_parts(source.pParameters, signature.params.len()).to_vec();
+        // Zero-parameter direct-indexed roots are legal and can have a null
+        // parameter pointer. Avoid forming a Rust slice from that pointer.
+        let mut parameters = if source.NumParameters == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(source.pParameters, signature.params.len()).to_vec()
+        };
         let mut range_storage = vec![Vec::new(); tables];
         for (index, ranges) in range_storage.iter_mut().enumerate().filter(|(i, _)| rewrite[*i]) {
             let parameter = &mut parameters[index];
@@ -439,7 +460,7 @@ fn reflected_root(
             // after this draw has been recorded.
             parameters.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
-                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+                ShaderVisibility: index_map_visibility,
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                         ShaderRegister: 0,
@@ -506,6 +527,13 @@ fn reflected_root(
 /// Keep every embedded range and append FSSM slots the root left out.
 /// Shaders that already translate keep their parameter indexes. The game's
 /// descriptor-table handle still addresses the slot FSSM recorded.
+/// CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED with no descriptor tables: only root
+/// constants and root descriptors, every resource picked by heap index.
+fn bindless_compute_root(signature: &tuxbox_dxbc::rootsig::RootSig) -> bool {
+    signature.flags & 0x400 != 0
+        && signature.params.iter().all(|p| matches!(p.kind, RootParamKind::Constants { .. } | RootParamKind::Descriptor { .. }))
+}
+
 fn append_corroborated_ranges(
     device: &ID3D12Device,
     original: &RootSource,
@@ -661,3 +689,7 @@ pub(super) fn capture_stage_root(stage: &[u8], root: &RootSource) {
         write(directory.join(format!("{shader}.dxbc")), stage);
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/device/compute_table.rs"]
+mod tests;
