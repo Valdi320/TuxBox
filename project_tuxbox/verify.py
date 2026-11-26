@@ -539,6 +539,17 @@ RASTER_SAMPLER_SLOTS = 1
 MESH_SAMPLER_SLOTS = 1
 
 
+def missing_mesh_worker_receipt(output, compiled):
+    """Require the exact mesh/pixel binaries loaded by the provider to be worker results."""
+    for stage in ("mesh", "pixel"):
+        loaded = set(re.findall(
+            rf"prepared {stage} shader loaded, source SHA-256 ([0-9a-f]{{64}})(?![0-9a-f])",
+            output))
+        if not loaded or not loaded.issubset(compiled):
+            return f"missing worker receipt for loaded {stage}: {loaded}"
+    return None
+
+
 def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
     """Draw with the Lanes console raster programs under a root with two tables.
 
@@ -550,14 +561,13 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
     adds to the reflected root. That root is serialized while the game runs, so
     nothing is prepared before launch: the host worker translates both programs
     against it. `mesh-samplers`: the same pixel program, declaring two samplers
-    the root has in another state, in a mesh pipeline. Only its records-only
-    mesh program's desktop translation (`mesh_samplers.hlsl`) is prepared; the
-    provider must add the literal state to the mesh root it builds and have the
-    worker translate the pixel program against that root.
+    the root has in another state, in a mesh pipeline. Both stages are
+    translated by the worker against the reflected root; the mesh program
+    exports guarded FP16-to-FP32 positions. No desktop shader is prepared.
     """
     from examples.lanes.raster_fixture import mesh, mesh_sampler_pixel, pixel, sampler_pixel, vertex
     from .runtime_shaders import shader_session
-    from .shader_prep import SOURCE_CACHE, compiler_tools, run_tool
+    from .shader_prep import SOURCE_CACHE
 
     sources = Path(host.env["WINEPREFIX"]) / SOURCE_CACHE
     rootless = {hashlib.sha256(data).hexdigest()
@@ -575,12 +585,6 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
             for path in [*sources.glob(f"{key}.*"), *sources.parent.glob(f"runtime/*/{key}.*")]:
                 path.unlink()
 
-    def prepare_mesh():
-        # The console mesh program has records only; its translation is this desktop shader.
-        sources.mkdir(parents=True, exist_ok=True)
-        hlsl = Path(__file__).resolve().parents[1] / "examples/lanes/mesh_samplers.hlsl"
-        run_tool([compiler_tools()[1], "-T", "ms_6_5", "-E", "main", "-O3", "-Fo", sources / f"{mesh_key}.cso", hlsl])
-
     def expect_reflected(slots, mesh_pipeline=False):
         def problem(output):
             if "substituted null " in output:
@@ -593,14 +597,23 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
                 return "the provider did not reflect the two-table root"
             if f"created raster pipeline with {slots} reflected FSSM descriptor slots" not in output:
                 return "the provider did not create the pipeline under the reflected root"
-            if compiled() & rootless:
+            if compiled() & (rootless | {mesh_key}):
                 return f"the worker translated a program without its root: {messages}"
+            if mesh_pipeline:
+                # A draw alone could pass with a prebuilt desktop mesh shader.
+                # Require the exact loaded binaries to have been requested from
+                # the Xbox shader worker during this scenario.
+                problem = missing_mesh_worker_receipt(output, compiled())
+                if problem:
+                    return f"{problem}; {messages}"
             return None
         return problem
 
-    names = ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_TRACE_RASTER_ROOTS", "TUXBOX_SHADER_SESSION", "TUXBOX_RASTER_ROOT_FALLBACK")
+    names = ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_TRACE_RASTER_ROOTS", "TUXBOX_SHADER_SESSION",
+             "TUXBOX_RASTER_ROOT_FALLBACK", "TUXBOX_NULL_PIPELINES")
     saved = {name: host.env.get(name) for name in names}
-    host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr", TUXBOX_TRACE_RASTER_ROOTS="1")
+    host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr", TUXBOX_TRACE_RASTER_ROOTS="1",
+                    TUXBOX_NULL_PIPELINES="0")
     # The fallback translates against the title's root and would hide a missing reflection.
     for name in ("TUXBOX_SHADER_SESSION", "TUXBOX_RASTER_ROOT_FALLBACK"):
         host.env.pop(name, None)
@@ -608,8 +621,6 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
         for scenario, slots in (("raster-tables", 3), ("raster-samplers", RASTER_SAMPLER_SLOTS),
                                 ("mesh-samplers", MESH_SAMPLER_SLOTS), ("mesh-sampler-single", MESH_SAMPLER_SLOTS)):
             forget(rootless | {mesh_key})
-            if scenario.startswith("mesh-"):
-                prepare_mesh()
             messages.clear()
             with shader_session(sources.parent, host.env, messages.append):
                 check(f"lanes-{scenario}", "lanes/lanes.exe", ["--selftest", scenario, *gpu_args, "--report"],
