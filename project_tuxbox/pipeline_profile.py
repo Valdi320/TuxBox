@@ -68,6 +68,7 @@ def pipeline_capture(backend, env, log):
     directory = Path(mkdtemp(prefix="pipelines-", dir=log.capture_parent())).resolve()
     trace = directory / "timeline.json"
     env.update(VKD3D_QUEUE_PROFILE=winpath(trace), VKD3D_QUEUE_PROFILE_ABSOLUTE="1")
+    env.setdefault("TUXBOX_PROFILE_SHADERS", "1")
     log.status(f"Pipeline timing capture: {trace}")
     try:
         yield

@@ -18,6 +18,7 @@ class PerformanceTests(unittest.TestCase):
             with pipeline_capture("proton", env, log):
                 first = Path(env["VKD3D_QUEUE_PROFILE"].removeprefix("Z:").replace("\\", "/"))
                 self.assertEqual(env["VKD3D_QUEUE_PROFILE_ABSOLUTE"], "1")
+                self.assertEqual(env["TUXBOX_PROFILE_SHADERS"], "1")
                 events = [
                     ("pso", "0000000000000001 GFX MISS", 100),
                     ("pso", "0000000000000001 FALLBACK OK", 155_500),
@@ -37,8 +38,10 @@ class PerformanceTests(unittest.TestCase):
             self.assertEqual(result["groups"]["driver_internal"]["calls"], 1)
             self.assertEqual(result["slowest"][0]["wine_seconds"], 2)
             self.assertEqual(result["slowest"][0]["operation"], "FALLBACK OK")
+            env["TUXBOX_PROFILE_SHADERS"] = "0"
             with pipeline_capture("proton", env, log):
                 self.assertNotIn(first.parent.name, env["VKD3D_QUEUE_PROFILE"])
+                self.assertEqual(env["TUXBOX_PROFILE_SHADERS"], "0")
 
     def test_managed_capture_uses_its_own_config_and_finalizes_after_game_error(self):
         with TemporaryDirectory(prefix="hud test ") as tmp, patch("shutil.which", return_value="/usr/bin/mangohud"), \

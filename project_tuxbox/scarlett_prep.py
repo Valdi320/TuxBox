@@ -16,6 +16,7 @@ from .prep_progress import PrepPhase, desktop_progress, report_progress
 from .runtime_shaders import REQUEST_PATTERNS, ShaderRefused, compile_request, snapshot_compiler_cache
 from .shader_prep import SOURCE_CACHE
 from .shader_diagnostics import normalize_refusal
+from .shader_profile import ShaderProfile
 from .shader_pack import seed_requests
 from .scarlett_report import aggregate, refusal_bucket, failure_bucket
 
@@ -118,9 +119,12 @@ def prepare_scarlett(executable, host):
         tools, cache = snapshot_compiler_cache(Path(tmp) / "xshader", cache_root)
         phase = PrepPhase(progress, "Previously used Xbox shaders", len(sources))
 
+        profile = ShaderProfile() if host.env.get("TUXBOX_PROFILE_SHADERS") == "1" else None
+        options = {"profile": profile} if profile is not None else {}
+
         def compile_one(source):
             try:
-                compiled = compile_request(source, source.stem, tools, cache, None)
+                compiled = compile_request(source, source.stem, tools, cache, None, **options)
                 return ("compiled" if compiled else "cached"), None, None, source.suffix, None
             except ShaderRefused as exc:
                 return "unsupported", None, refusal_bucket(exc), source.suffix, normalize_refusal(str(exc)) if exc.reason_known else None
@@ -146,6 +150,8 @@ def prepare_scarlett(executable, host):
                              unsupported=totals["unsupported"], failed=totals["failed"])
         finally:
             workers.shutdown(cancel_futures=True)
+            if profile is not None:
+                profile.report("preparation", lambda message: report_progress(None, message))
 
         elapsed = monotonic() - started
         unsupported = totals["unsupported"]

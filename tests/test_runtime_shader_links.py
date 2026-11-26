@@ -356,6 +356,56 @@ class RuntimeShaderLinks(unittest.TestCase):
         self.assertIn("-O0", dxc_calls[1].args[0])
         self.assertEqual((self.session / (key + ".cso")).read_bytes(), dxil)
 
+    def test_profile_distinguishes_cold_warm_and_fallback_attempts(self):
+        from project_tuxbox.shader_profile import ShaderProfile
+        data = b"synthetic program for profiling"
+        key = hashlib.sha256(data).hexdigest()
+        source = self.requests / (key + ".dxbc")
+        source.write_bytes(data)
+        expected = portable_program(5, b"result")
+
+        def tool(args, *, timeout):
+            if args[0] == "xshader":
+                args[args.index("--hlsl-out") + 1].write_text("shader")
+                args[args.index("--profile-out") + 1].write_text("cs_6_0")
+            elif args[0] == "dxc":
+                if "-O0" not in args:
+                    raise subprocess.TimeoutExpired("dxc", timeout)
+                args[args.index("-Fo") + 1].write_bytes(expected)
+
+        profile = ShaderProfile()
+        with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=tool):
+            self.assertTrue(compile_request(source, key, self.tools, self.cache, self.session, profile=profile))
+            self.assertFalse(compile_request(source, key, self.tools, self.cache, self.session, profile=profile))
+        summary = profile.summary()
+        self.assertEqual(summary["requests"], {"compiled": 1, "cached": 1})
+        for stage, status in (("xshader", "ok"), ("dxc_default", "timeout"),
+                              ("dxc_o0", "ok"), ("dxv", "ok")):
+            self.assertEqual(summary["stages"][stage]["outcomes"], {status: 1})
+        self.assertNotIn(key, str(summary))
+        self.assertEqual((self.session / (key + ".cso")).read_bytes(), expected)
+
+    def test_profile_does_not_hide_refusals_or_retryable_errors(self):
+        from project_tuxbox.shader_profile import ShaderProfile
+        profile = ShaderProfile()
+        data = b"synthetic refused program"
+        key = hashlib.sha256(data).hexdigest()
+        source = self.requests / (key + ".dxbc")
+        source.write_bytes(data)
+        with patch("project_tuxbox.runtime_shaders.run_tool",
+                   side_effect=ToolFailure("xshader", 65, "private reason")):
+            for cached in (False, True):
+                with self.assertRaises(ShaderRefused) as result:
+                    compile_request(source, key, self.tools, self.cache, self.session, profile=profile)
+                self.assertEqual(result.exception.cached, cached)
+        source.write_bytes(b"corrupt")
+        with self.assertRaises(ValueError):
+            compile_request(source, key, self.tools, self.cache, self.session, profile=profile)
+        summary = profile.summary()
+        self.assertEqual(summary["requests"], {"refused": 1, "cached_refusal": 1, "failed": 1})
+        self.assertEqual(summary["stages"]["xshader"]["outcomes"], {"error": 1})
+        self.assertNotIn("private reason", str(summary))
+
     def test_large_pixel_candidate_precedes_slow_marker_and_validates_once(self):
         """Cold large ps_6_6 requests validate the candidate before publication."""
         program = b"Xbox pixel shader"

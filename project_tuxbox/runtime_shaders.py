@@ -18,6 +18,7 @@ from .dxil_store import COMPUTE_FLAGS, VARIANTS, DxilStore, write_identity
 from .inspect import digest
 from .persistent_dxc import PersistentDxc
 from .shader_diagnostics import refusal_line
+from .shader_profile import ShaderProfile, timed, count_reuse
 from .shader_prep import SOURCE_CACHE, ToolFailure, compiler_tools, run_tool
 
 
@@ -145,7 +146,7 @@ def remembered_reason(path):
 
 
 @contextmanager
-def compile_lock(cache, key, timeout=90):
+def compile_lock(cache, key, timeout=90, *, stage="source_cache_lock"):
     """Serialize an exact cold cache key across independent launcher processes.
 
     Keep the lock inode for this compiler fingerprint: unlinking it on
@@ -161,15 +162,17 @@ def compile_lock(cache, key, timeout=90):
     with os.fdopen(os.open(directory / key, flags, 0o600), "r+b") as stream:
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
             raise ValueError("shader cache lock is not a regular file")
-        deadline = monotonic() + timeout
-        while True:
-            try:
-                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if monotonic() >= deadline:
-                    raise TimeoutError("shader cache lock wait timed out")
-                sleep(min(.025, max(0, deadline - monotonic())))
+        def acquire():
+            deadline = monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return
+                except BlockingIOError:
+                    if monotonic() >= deadline:
+                        raise TimeoutError("shader cache lock wait timed out")
+                    sleep(min(.025, max(0, deadline - monotonic())))
+        timed(stage, acquire)
         try:
             yield
         finally:
@@ -234,7 +237,7 @@ DISPATCHER = b"while (tb_pc != "
 
 def validated_dxil(dxv, output, stage):
     """Return bounded, stage-correct output bytes after DXV accepts the file."""
-    run_tool([dxv, output], timeout=10)
+    timed("dxv", run_tool, [dxv, output], timeout=10)
     data = bounded_shader(output)
     if portable_stage(data) != stage:
         raise ValueError("compiler returned invalid DXIL or a different shader stage")
@@ -254,7 +257,7 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
     dispatched = target != "cs_6_6" and DISPATCHER in hlsl.read_bytes()
     if dispatched or target == "ps_6_6" and hlsl.stat().st_size >= (256 << 10):
         try:
-            run_tool([dxc, "-T", target, *entry, "-disable-lifetime-markers",
+            timed("dxc_no_lifetime", run_tool, [dxc, "-T", target, *entry, "-disable-lifetime-markers",
                       "-Fo", output, hlsl], timeout=15)
             if not output.exists():
                 raise ValueError("compiler returned no DXIL output")
@@ -264,13 +267,13 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
     # A dispatched program whose candidate failed, or a request that timed out
     # before, goes straight to -O0 rather than spending the cap again.
     if dispatched or (store and store.is_slow(request, target)):
-        run_tool(unoptimised, timeout=o0_timeout(hlsl))
+        timed("dxc_o0", run_tool, unoptimised, timeout=o0_timeout(hlsl))
         return validated_dxil(dxv, output, stage)
     # See `COMPUTE_FLAGS`. -O0 remains the fallback: the largest programs still
     # compile that way when the optimiser fails or runs out of time.
     if target == "cs_6_6":
         try:
-            run_tool([dxc, "-T", target, *entry, *COMPUTE_FLAGS, "-Fo", output, hlsl], timeout=COMPUTE_TIMEOUT)
+            timed("dxc_compute", run_tool, [dxc, "-T", target, *entry, *COMPUTE_FLAGS, "-Fo", output, hlsl], timeout=COMPUTE_TIMEOUT)
             if not output.exists():
                 raise ValueError("compiler returned no DXIL output")
             return validated_dxil(dxv, output, stage)
@@ -280,19 +283,26 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
         except ValueError:
             pass
         output.unlink(missing_ok=True)
-        run_tool(unoptimised, timeout=o0_timeout(hlsl))
+        timed("dxc_o0", run_tool, unoptimised, timeout=o0_timeout(hlsl))
         return validated_dxil(dxv, output, stage)
     try:
-        run_tool([dxc, "-T", target, *entry, "-Fo", output, hlsl], timeout=15)
+        timed("dxc_default", run_tool, [dxc, "-T", target, *entry, "-Fo", output, hlsl], timeout=15)
     except subprocess.TimeoutExpired:
         if store:
             store.mark_slow(request, target)
         output.unlink(missing_ok=True)
-        run_tool(unoptimised, timeout=o0_timeout(hlsl))
+        timed("dxc_o0", run_tool, unoptimised, timeout=o0_timeout(hlsl))
     return validated_dxil(dxv, output, stage)
 
 
-def compile_request(source, key, tools, cache, session, *, remember=None, persistent=None):
+def compile_request(source, key, tools, cache, session, *, remember=None, persistent=None, profile=None):
+    if profile is not None:
+        return profile.request(_compile_request, ShaderRefused, source, key, tools, cache, session,
+                               remember=remember, persistent=persistent)
+    return _compile_request(source, key, tools, cache, session, remember=remember, persistent=persistent)
+
+
+def _compile_request(source, key, tools, cache, session, *, remember=None, persistent=None):
     linked = source.suffix == ".link"
     xshader, dxc, dxv = tools
     with TemporaryDirectory(dir=cache) as tmp:
@@ -342,8 +352,9 @@ def compile_request(source, key, tools, cache, session, *, remember=None, persis
             stages &= {expected_stage}
         del source_data
         def reuse():
-            cached = cache_snapshot(dest, checksum, stages)
+            cached = timed("source_cache_lookup", cache_snapshot, dest, checksum, stages)
             if cached is not None:
+                count_reuse("source")
                 # Prelaunch hits need no temporary DXIL copy.
                 if session is not None:
                     reply.write_bytes(cached)
@@ -364,9 +375,9 @@ def compile_request(source, key, tools, cache, session, *, remember=None, persis
                 return False
             hlsl, output, profile = (work / name for name in ("shader.hlsl", "out.cso", "profile"))
             if linked:
-                run_tool([dxv, order], timeout=10)
+                timed("dxv_input", run_tool, [dxv, order], timeout=10)
             try:
-                run_tool([xshader, cooked, *flags, "--hlsl-out", hlsl, "--profile-out", profile], timeout=30)
+                timed("xshader", run_tool, [xshader, cooked, *flags, "--hlsl-out", hlsl, "--profile-out", profile], timeout=30)
             except ToolFailure as error:
                 # xshader reserves this status for the in-process HLSL emitter. DXC, DXV,
                 # input parsing, tool startup and filesystem failures remain retryable.
@@ -395,8 +406,9 @@ def compile_request(source, key, tools, cache, session, *, remember=None, persis
             store = DxilStore.for_cache(cache)
             content = store.key(hlsl.read_bytes(), target) if store else None
             def reuse_content():
-                data = bounded_shader(output) if store and store.fetch(content, output) else None
+                data = bounded_shader(output) if store and timed("content_cache_lookup", store.fetch, content, output) else None
                 if data is not None and portable_stage(data) == target_stage:
+                    count_reuse("content")
                     return data
                 output.unlink(missing_ok=True)
                 return None
@@ -408,14 +420,15 @@ def compile_request(source, key, tools, cache, session, *, remember=None, persis
                 # Acquire the shared toolchain/content lock only after a miss.
                 # Always acquire source before content; never the reverse.
                 # Allow time for the optimised attempt, fallback and validation.
-                lock = (compile_lock(store.root, content, timeout=O0_TIMEOUT_MAX + COMPUTE_TIMEOUT + 60)
+                lock = (compile_lock(store.root, content, timeout=O0_TIMEOUT_MAX + COMPUTE_TIMEOUT + 60,
+                                     stage="content_cache_lock")
                         if store else nullcontext())
                 with lock:
                     data = reuse_content() if store else None
                     if data is None:
                         if (persistent is not None and target == "cs_6_0"
                                 and not (store and store.is_slow(key, target))
-                                and persistent.compile(dxc, hlsl, output)):
+                                and timed("dxc_persistent", persistent.compile, dxc, hlsl, output)):
                             try:
                                 data = validated_dxil(dxv, output, target_stage)
                             except (OSError, ValueError, subprocess.SubprocessError) as error:
@@ -424,7 +437,7 @@ def compile_request(source, key, tools, cache, session, *, remember=None, persis
                         if data is None:
                             data = compile_dxil(dxc, dxv, target, hlsl, output, store, key, target_stage)
                         if store:
-                            store.save(content, output)
+                            timed("content_cache_publish", store.save, content, output)
             stamp = work / "sha256"
             stamp.write_text(hashlib.sha256(data).hexdigest())
             if session is not None:
@@ -443,7 +456,7 @@ def remove_request(path):
         path.unlink(missing_ok=True)
 
 
-def serve(session, stop, report, archive=None, jobs=1, *, dxc_helper=None):
+def serve(session, stop, report, archive=None, jobs=1, *, dxc_helper=None, profile=None):
     # Cargo can replace the release executable while another title is running.
     # Keep the executable we fingerprint private to this host worker.
     with TemporaryDirectory(prefix="tuxbox-xshader-") as tmp, request_notifications(session / "requests", stop) as wait:
@@ -457,7 +470,7 @@ def serve(session, stop, report, archive=None, jobs=1, *, dxc_helper=None):
             except OSError as error:
                 report(f"Could not stage persistent DXC, using the CLI: {error}")
         with PersistentDxc(pinned, jobs, report) if pinned else nullcontext() as persistent:
-            _serve_requests(session, stop, report, Path(tmp) / "xshader", wait, archive, jobs, persistent=persistent)
+            _serve_requests(session, stop, report, Path(tmp) / "xshader", wait, archive, jobs, persistent=persistent, profile=profile)
 
 
 @contextmanager
@@ -552,7 +565,7 @@ def ordered_requests(directory):
     return [source for _, _, source in sorted(entries)]
 
 
-def _serve_requests(session, stop, report, xshader, wait, archive, jobs=1, *, persistent=None):
+def _serve_requests(session, stop, report, xshader, wait, archive, jobs=1, *, persistent=None, profile=None):
     def bind_cache():
         options = {"dxc_helper": persistent.helper} if persistent is not None else {}
         tools, cache = snapshot_compiler_cache(xshader, session.parent, **options)
@@ -589,6 +602,8 @@ def _serve_requests(session, stop, report, xshader, wait, archive, jobs=1, *, pe
         options = {"remember": remember} if record_requests else {}
         if persistent is not None:
             options["persistent"] = persistent
+        if profile is not None:
+            options["profile"] = profile
         return compile_request(source, key, bound_tools, bound_cache, session, **options)
 
     def complete(source, key, future=None, error=None):
@@ -693,6 +708,9 @@ def shader_session(cache, env, report, *, archive=None):
         stop = Event()
         helper = env.get("TUXBOX_PERSISTENT_DXC")
         options = {"dxc_helper": helper} if helper else {}
+        profile = ShaderProfile() if env.get("TUXBOX_PROFILE_SHADERS") == "1" else None
+        if profile is not None:
+            options["profile"] = profile
         worker = Thread(target=serve, args=(session, stop, report, archive, runtime_jobs(env, report)),
                         kwargs=options, name="shader-compiler", daemon=True)
         worker.start()
@@ -702,3 +720,5 @@ def shader_session(cache, env, report, *, archive=None):
             stop.set()
             worker.join()
             env.pop("TUXBOX_SHADER_SESSION", None)
+            if profile is not None:
+                profile.report("runtime", report)
