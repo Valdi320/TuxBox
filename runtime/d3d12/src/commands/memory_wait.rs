@@ -8,7 +8,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize};
 use std::sync::{Condvar, LazyLock, Once, mpsc};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{HANDLE, WAIT_FAILED};
+use windows::Win32::Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::core::Result;
 
@@ -690,6 +690,12 @@ impl Drop for ActiveWaitGuard {
     }
 }
 
+mod fence_poll;
+
+// Poll removal while waiting for a notification; a healthy slow prefix
+// retains its original ordering and has no new deadline.
+const PREFIX_POLL_MS: u32 = 100;
+
 struct WorkerEvent(Option<OwnedHandle>);
 
 impl WorkerEvent {
@@ -717,27 +723,34 @@ impl WorkerEvent {
                 .unwrap_or_else(|| E_FAIL.into()));
         }
         if completed >= value {
-            return Ok(());
+            return unsafe { device.GetDeviceRemovedReason() };
         }
         let event = self.handle();
         if event.is_invalid() {
-            unsafe { fence.SetEventOnCompletion(value, HANDLE::default())? };
-        } else {
-            unsafe { fence.SetEventOnCompletion(value, event)? };
-            if unsafe { WaitForSingleObject(event, INFINITE) } == WAIT_FAILED {
-                // Keep the handle alive if D3D12 still retains a pending registration.
-                if unsafe { fence.GetCompletedValue() } < value {
-                    std::mem::forget(self.0.take());
-                }
-                return Err(E_FAIL.into());
+            return Err(E_FAIL.into());
+        }
+        unsafe { fence.SetEventOnCompletion(value, event)? };
+        let result = fence_poll::poll(
+            value,
+            || unsafe { fence.GetCompletedValue() },
+            || unsafe { device.GetDeviceRemovedReason() },
+            || match unsafe { WaitForSingleObject(event, PREFIX_POLL_MS) } {
+                WAIT_OBJECT_0 | WAIT_TIMEOUT => Ok(()),
+                _ => Err(E_FAIL.into()),
+            },
+            || E_FAIL.into(),
+        );
+        if result.is_err() {
+            // A driver may still retain the registered event when the wait
+            // fails. Preserve its handle until process exit, just as on the
+            // old WAIT_FAILED path. The worker stops after this error.
+            // MAX is removal, not evidence that the registered value retired.
+            let observed = unsafe { fence.GetCompletedValue() };
+            if observed == u64::MAX || observed < value {
+                std::mem::forget(self.0.take());
             }
         }
-        if unsafe { fence.GetCompletedValue() } == u64::MAX {
-            return Err(unsafe { device.GetDeviceRemovedReason() }
-                .err()
-                .unwrap_or_else(|| E_FAIL.into()));
-        }
-        Ok(())
+        result
     }
 }
 
