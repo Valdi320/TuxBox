@@ -394,22 +394,37 @@ def compile_request(source, key, tools, cache, session, *, remember=None, persis
             # compiler policy changes deliberately leave warm cache entries valid.
             store = DxilStore.for_cache(cache)
             content = store.key(hlsl.read_bytes(), target) if store else None
-            data = bounded_shader(output) if store and store.fetch(content, output) else None
-            if data is None or portable_stage(data) != target_stage:
+            def reuse_content():
+                data = bounded_shader(output) if store and store.fetch(content, output) else None
+                if data is not None and portable_stage(data) == target_stage:
+                    return data
                 output.unlink(missing_ok=True)
-                data = None
-                if (persistent is not None and target == "cs_6_0"
-                        and not (store and store.is_slow(key, target))
-                        and persistent.compile(dxc, hlsl, output)):
-                    try:
-                        data = validated_dxil(dxv, output, target_stage)
-                    except (OSError, ValueError, subprocess.SubprocessError) as error:
-                        persistent.report(f"Persistent DXC output rejected, using the CLI: {error}")
-                        output.unlink(missing_ok=True)
-                if data is None:
-                    data = compile_dxil(dxc, dxv, target, hlsl, output, store, key, target_stage)
-                if store:
-                    store.save(content, output)
+                return None
+
+            data = reuse_content()
+            if data is None:
+                # The exact-source lock above cannot deduplicate different
+                # requests (or translator builds) that emit identical HLSL.
+                # Acquire the shared toolchain/content lock only after a miss.
+                # Always acquire source before content; never the reverse.
+                # Allow time for the optimised attempt, fallback and validation.
+                lock = (compile_lock(store.root, content, timeout=O0_TIMEOUT_MAX + COMPUTE_TIMEOUT + 60)
+                        if store else nullcontext())
+                with lock:
+                    data = reuse_content() if store else None
+                    if data is None:
+                        if (persistent is not None and target == "cs_6_0"
+                                and not (store and store.is_slow(key, target))
+                                and persistent.compile(dxc, hlsl, output)):
+                            try:
+                                data = validated_dxil(dxv, output, target_stage)
+                            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                                persistent.report(f"Persistent DXC output rejected, using the CLI: {error}")
+                                output.unlink(missing_ok=True)
+                        if data is None:
+                            data = compile_dxil(dxc, dxv, target, hlsl, output, store, key, target_stage)
+                        if store:
+                            store.save(content, output)
             stamp = work / "sha256"
             stamp.write_text(hashlib.sha256(data).hexdigest())
             if session is not None:

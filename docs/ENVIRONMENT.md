@@ -93,3 +93,13 @@ All are off by default. Capture variables write the game's data to disk, so don'
 ## Build and test tools
 
 `TUXBOX_XSHADER` selects the shader compiler for launcher preparation and `DXC` selects the DirectX Shader Compiler. `TUXBOX_BLESS_PROFILES`, `TUXBOX_ORACLE_*`, `TUXBOX_TEST_*` and the probe and replay variables in `tools/` belong to individual checks. `TUXBOX_PROVIDER`, `TUXBOX_SHADER_SESSION` and `TUXBOX_WINE_*` are internal; don't set them.
+
+
+Cold shader requests that translate to identical HLSL and the same target
+profile share a single DXC compilation across launcher processes using the
+same toolchain cache. Exact source cache hits still bypass compilation and
+locking. Different HLSL or target profiles compile independently. A failed
+compile does not publish an unsupported marker for another source; the next
+request can retry. Content locks are retained as empty files to avoid races
+with other processes. The wait is bounded by the maximum compiler fallback
+budget plus validation and scheduling margin.
