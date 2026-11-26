@@ -46,11 +46,12 @@ class RuntimeShaderWorkers(unittest.TestCase):
             path.write_text(name)
         return path
 
-    def start(self, compile_one, jobs=2, archive=None):
+    def start(self, compile_one, jobs=2, archive=None, *, fast_lane=False):
         def worker():
             try:
                 _serve_requests(self.session, self.stop, self.logs.append,
-                                self.root / "xshader", lambda: sleep(0.005), archive, jobs)
+                                self.root / "xshader", lambda: sleep(0.005), archive, jobs,
+                                **({"fast_lane": True} if fast_lane else {}))
             except Exception as exc:
                 self.errors.append(exc)
 
@@ -111,6 +112,91 @@ class RuntimeShaderWorkers(unittest.TestCase):
         self.release.set()
         self.until(lambda: not any(self.requests.iterdir()))
         self.assertEqual(counts, Counter({p.stem: 1 for p in (slow, fast, later)}))
+
+    def test_fast_lane_reserves_worker_for_small_shaders(self):
+        heavy = [self.request(f"heavy-{i}") for i in range(3)]
+        quick = self.request("quick")
+        for n, path in enumerate((*heavy, quick)):
+            os.utime(path, ns=(n + 1, n + 1))
+        attempts, completed = Counter(), Counter()
+        running = peak = 0
+        guard = Lock()
+
+        def compile_one(source, key, tools, cache, session, *, admit_large=None):
+            nonlocal running, peak
+            with guard:
+                attempts[source] += 1
+            if source in heavy:
+                admit_large(512 << 10)
+                with guard:
+                    running += 1
+                    peak = max(peak, running)
+                try:
+                    if not self.release.wait(5):
+                        raise TimeoutError("test gate")
+                finally:
+                    with guard:
+                        running -= 1
+            else:
+                admit_large(1024)
+            (session / (key + ".cso")).write_bytes(b"result")
+            with guard:
+                completed[source] += 1
+            return True
+
+        self.start(compile_one, jobs=2, fast_lane=True)
+        self.until(lambda: (self.session / (quick.stem + ".cso")).exists())
+        self.assertEqual(peak, 1)
+        self.assertTrue(all(path.exists() for path in heavy))
+        self.assertFalse(any(self.session.glob("*.failed")))
+        self.release.set()
+        self.until(lambda: not any(self.requests.iterdir()))
+        self.assertEqual(completed, Counter({p: 1 for p in (*heavy, quick)}))
+        self.assertTrue(all(1 <= attempts[p] <= 2 for p in heavy))
+        self.assertEqual(attempts[quick], 1)
+        self.assertEqual(peak, 1)
+
+    def test_fast_lane_shutdown_leaves_deferred_request_pending(self):
+        from project_tuxbox.runtime_shaders import DeferredShader
+        heavy, waiting = self.request("heavy"), self.request("waiting")
+        os.utime(heavy, ns=(1, 1))
+        os.utime(waiting, ns=(2, 2))
+        admitted, deferred = Event(), Event()
+
+        def compile_one(source, key, tools, cache, session, *, admit_large=None):
+            if source == heavy:
+                admit_large(512 << 10)
+                admitted.set()
+                if not self.release.wait(5):
+                    raise TimeoutError("test gate")
+            else:
+                if not admitted.wait(5):
+                    raise TimeoutError("test gate")
+                try:
+                    admit_large(512 << 10)
+                except DeferredShader:
+                    deferred.set()
+                    raise
+            return False
+
+        thread = self.start(compile_one, jobs=2, fast_lane=True)
+        self.until(deferred.is_set)
+        self.stop.set()
+        self.release.set()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(heavy.exists())
+        self.assertTrue(waiting.exists())
+        self.assertFalse(any(self.session.glob("*.failed")))
+
+    def test_fast_lane_with_one_worker_uses_normal_path(self):
+        source = self.request("only")
+        def compile_one(source, key, tools, cache, session):
+            (session / (key + ".cso")).write_bytes(b"result")
+            return True
+        self.start(compile_one, jobs=1, fast_lane=True)
+        self.until(lambda: not source.exists())
+        self.assertTrue((self.session / (source.stem + ".cso")).exists())
 
     def test_shutdown_drains_active_jobs_without_starting_new_jobs(self):
         paths = [self.request(str(i)) for i in range(5)]

@@ -18,6 +18,10 @@ _active = ContextVar("shader_profile", default=None)
 _stage = ContextVar("shader_profile_stage", default=None)
 
 
+class DeferredShader(Exception):
+    """Retry a translated cold request when a large-compile slot is free."""
+
+
 class ShaderProfile:
     def __init__(self):
         self._start = monotonic_ns()
@@ -42,6 +46,9 @@ class ShaderProfile:
             result = function(*args, **kwargs)
             outcome = "compiled" if result else "cached"
             return result
+        except DeferredShader:
+            outcome = "deferred"
+            raise
         except refusal_type as error:
             outcome = "cached_refusal" if error.cached else "refused"
             raise

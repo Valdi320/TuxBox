@@ -42,6 +42,7 @@ The launcher sets these for a Proton or Wine launch. A value you set yourself is
 | `TUXBOX_RUNTIME_SHADERS` | on | `0` stops translating shaders during play |
 | `TUXBOX_RUNTIME_SHADER_JOBS` | half the CPU cores, at least 2 where there are two, at most 32 | Compiler jobs during play, 1 to 32 |
 | `TUXBOX_PROFILE_SHADERS` | `0` | Set to `1` for aggregate host shader-stage timing in the log (preparation and runtime). No title identifiers are included; `--profile-pipelines` enables runtime timing unless explicitly disabled. |
+| `TUXBOX_RUNTIME_FAST_LANE` | off (experimental) | `1` reserves one live worker for smaller requests when there are at least two workers |
 | `TUXBOX_SHADER_PREP_JOBS` | one per CPU core, at most 32 | Compiler jobs for ProjectScarlett preparation |
 | `TUXBOX_SHADER_PREP` | `chase` | Frosty preparation: `0`, `1`, `menu` or `chase` |
 | `TUXBOX_SHADER_PREP_UI` | on for ProjectScarlett | `1` shows a desktop progress window |
@@ -118,7 +119,7 @@ disabled. Keep the existing game log if the results need to be compared later.
 identical DXIL); `reuse.content` counts those that did not need DXC again.
 `reuse.source` counts exact cached entries served by the host. A warm guest
 can read its cache without sending a request at all, so an empty runtime
-profile is valid. Refused, cached-refusal and failed requests stay separate.
+profile is valid. Refused, cached-refusal, deferred and failed attempts stay separate.
 Stage outcomes count tool attempts, not shaders: a timeout and its successful
 fallback are separate calls. Stage totals sum concurrent worker wall times
 and can exceed the elapsed session time; they are not CPU time. The existing
@@ -138,3 +139,13 @@ These host measurements cover dispatched requests, not guest-side cache
 lookups or compiler discovery. They contain no shader hashes, title names
 or raw error text. A forcibly killed launcher may not finish writing its
 summary.
+
+The experimental runtime fast lane uses the size of translated HLSL (256 KiB
+or larger) as a hint for large cold DXC compiles, not as a guarantee of
+compiler cost. Warm entries bypass the admission check. A cold large request reserves a slot before waiting for a shared content lock, so a duplicate waiter cannot monopolize the reserved lane. If all large slots
+are occupied, a new large request stays pending without a failure marker
+and is translated again when a slot is free. Known large requests keep
+their relative publication order. This can delay batches consisting solely
+of large shaders, and small but expensive programs can still occupy the
+reserved worker. The existing worker count remains a hard limit; one
+worker behaves as before. Launch-time shader preparation is unchanged.
