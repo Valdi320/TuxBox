@@ -145,7 +145,7 @@ int main() {
     try {
         for (const char* name : {"plain-3", "swizzle-3", "plain-67", "swizzle-67",
                                  "plain-128", "swizzle-128", "plain-0", "swizzle-0",
-                                 "plain-129", "swizzle-129", "bad-index"}) {
+                                 "plain-129", "swizzle-129", "bad-index", "half-3", "half-67", "half-128"}) {
             const std::string id(name);
             const bool draw = id != "bad-index" && id.find("-0") == std::string::npos
                 && id.find("-129") == std::string::npos;
