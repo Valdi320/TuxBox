@@ -315,10 +315,13 @@ impl Pool {
                 }
             }
             SlotRole::SecondaryAlias => {
+                let held = self.has_hold(at, at + PAGE);
                 let page = self.pages.get_mut(&token).expect("validated token");
                 page.aliases += 1;
                 page.cpu_views += 1;
-                self.secondary_aliases.insert(at);
+                if !held {
+                    self.secondary_aliases.insert(at);
+                }
             }
         }
     }
@@ -333,7 +336,8 @@ impl Pool {
             return Err(ERROR_BUSY);
         }
         let role = self.classify_private_slot(at, token, gpu_alias);
-        let protect = if matches!(role, SlotRole::SecondaryAlias) {
+        let mask_slot = matches!(role, SlotRole::SecondaryAlias) && !self.has_hold(at, at + PAGE);
+        let protect = if mask_slot {
             PAGE_NOACCESS
         } else {
             PAGE_READWRITE
@@ -364,7 +368,7 @@ impl Pool {
                 shared_pages::protect_private_range(old_va, PAGE, PAGE_NOACCESS)?;
                 ensure_secondary_alias_veh();
             }
-            if matches!(role, SlotRole::SecondaryAlias) {
+            if mask_slot {
                 ensure_secondary_alias_veh();
             }
             span.mapped += 1;
@@ -413,7 +417,7 @@ impl Pool {
             shared_pages::protect_private_range(old_va, PAGE, PAGE_NOACCESS)?;
             ensure_secondary_alias_veh();
         }
-        if matches!(role, SlotRole::SecondaryAlias) {
+        if mask_slot {
             ensure_secondary_alias_veh();
         }
         self.private_views.insert(
@@ -457,7 +461,13 @@ impl Pool {
             }
             roles.push(self.classify_private_slot(start + i * PAGE, token, gpu_alias));
         }
-        let all_secondary = roles.iter().all(|r| matches!(r, SlotRole::SecondaryAlias));
+        let mask_slot = |va: usize, role: SlotRole| {
+            matches!(role, SlotRole::SecondaryAlias) && !self.has_hold(va, va + PAGE)
+        };
+        let all_secondary = roles
+            .iter()
+            .enumerate()
+            .all(|(i, &r)| mask_slot(start + i * PAGE, r));
         let base_protect = if all_secondary {
             PAGE_NOACCESS
         } else {
@@ -466,8 +476,11 @@ impl Pool {
         let mut mask_new = Vec::new();
         let mut demote_old = Vec::new();
         for (i, &role) in roles.iter().enumerate() {
+            let va = start + i * PAGE;
             match role {
-                SlotRole::SecondaryAlias if !all_secondary => mask_new.push(start + i * PAGE),
+                SlotRole::SecondaryAlias if !all_secondary && mask_slot(va, role) => {
+                    mask_new.push(va);
+                }
                 SlotRole::Upgrade(old_va) if !self.has_hold(old_va, old_va + PAGE) => {
                     demote_old.push(old_va);
                 }

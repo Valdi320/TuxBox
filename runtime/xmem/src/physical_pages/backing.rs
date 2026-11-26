@@ -54,6 +54,13 @@ impl Drop for PrivateArena {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackingOrigin {
+    PrivateView,
+    PrivateArena(usize),
+    SharedSection,
+}
+
 #[derive(Clone, Default)]
 pub(super) enum PageBacking {
     #[default]
@@ -121,7 +128,16 @@ impl Pool {
             }
         }
         if mapped_count == 0 {
-            return Err(ERROR_NOT_FOUND);
+            let in_xmem_aperture = (address..end).step_by(PAGE).any(|va| {
+                self.deferred_unmaps.contains_key(&va)
+                    || self.private_span(va).is_some()
+                    || self.aperture(va).is_some()
+            });
+            return Err(if in_xmem_aperture {
+                ERROR_INVALID_ADDRESS
+            } else {
+                ERROR_NOT_FOUND
+            });
         }
         if unmapped_count != 0 {
             return Err(ERROR_INVALID_ADDRESS);
@@ -159,39 +175,43 @@ impl Pool {
         }
 
         let mut runs: Vec<BackingRun> = Vec::new();
+        let mut last_origin: Option<BackingOrigin> = None;
         let mut pinned_views = Vec::new();
         let mut pinned_set = HashSet::new();
         let mut arenas: Vec<Arc<PrivateArena>> = Vec::new();
         let mut arena_set = HashSet::new();
         for &(va, token) in &guest_tokens {
-            let host = match &self.pages[&token].backing {
+            let (host, origin) = match &self.pages[&token].backing {
                 PageBacking::PrivateView(view_va) => {
                     if pinned_set.insert(*view_va) {
                         pinned_views.push(*view_va);
                     }
-                    *view_va as u64
+                    (*view_va as u64, BackingOrigin::PrivateView)
                 }
                 PageBacking::PrivateArena { arena, offset } => {
-                    if arena_set.insert(Arc::as_ptr(arena) as usize) {
+                    let arena_ptr = Arc::as_ptr(arena) as usize;
+                    if arena_set.insert(arena_ptr) {
                         arenas.push(Arc::clone(arena));
                     }
-                    (arena.base() + *offset) as u64
+                    ((arena.base() + *offset) as u64, BackingOrigin::PrivateArena(arena_ptr))
                 }
                 PageBacking::SharedSection => {
                     if pinned_set.insert(va) {
                         pinned_views.push(va);
                     }
-                    va as u64
+                    (va as u64, BackingOrigin::SharedSection)
                 }
                 PageBacking::Unbacked => unreachable!("all unbacked tokens received a PrivateArena"),
             };
-            if let Some(last) = runs.last_mut()
+            if last_origin == Some(origin)
+                && let Some(last) = runs.last_mut()
                 && last.address + last.bytes == host
             {
                 last.bytes += PAGE as u64;
             } else {
                 runs.push(BackingRun { address: host, bytes: PAGE as u64 });
             }
+            last_origin = Some(origin);
         }
         Ok((runs, HoldRecord { arenas, pinned_views }))
     }
@@ -263,11 +283,15 @@ impl Pool {
                                 self.private_views.remove(&lo);
                                 self.release_aperture_pages(base, extent, (span.end - lo) / PAGE);
                             } else {
+                                span.deferred += 1;
                                 self.private_views.insert(lo, span);
+                                self.deferred_unmaps.insert(va, kind);
                             }
                         } else if shared_pages::decommit_private_range(va, PAGE).is_ok() {
                             self.private_views.insert(lo, span);
                         } else {
+                            span.deferred += 1;
+                            self.private_views.insert(lo, span);
                             self.deferred_unmaps.insert(va, kind);
                         }
                     }

@@ -57,7 +57,7 @@ impl PagePools {
                 trace_import_failure(source, "sized", size, error.code());
                 error
             })?;
-            Ok(Arc::new(ImportedHeap::direct(native, pin, backing)))
+            Ok(Arc::new(ImportedHeap::direct(native, pin, backing)?))
         };
         if size == u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
             use std::sync::atomic::AtomicU64;

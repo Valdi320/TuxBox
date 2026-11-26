@@ -400,3 +400,134 @@ fn gpu_pool_then_plain_cpu_view_upgrades_backing_and_keeps_mem_private() {
     assert_ne!(unsafe { VirtualFree(cpu_view, 0, MEM_RELEASE) }, 0);
     assert_ne!(unsafe { VirtualFree(gpu_alias2, 0, MEM_RELEASE) }, 0);
 }
+
+#[test]
+fn remapping_held_deferred_slot_as_secondary_alias_keeps_page_readwrite() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut tokens = [0u64; 2];
+    let mut count = 2usize;
+    assert_eq!(unsafe { allocate(super::super::FLAGS, &mut count, tokens.as_mut_ptr()) }, 1);
+
+    let gpu_slot = reserve_aperture(1);
+    let cpu_view = unsafe { virtual_alloc(ptr::null_mut(), PAGE, 0x2040_2000, 0x21, PAGE_READWRITE) };
+    assert!(!gpu_slot.is_null() && !cpu_view.is_null());
+
+    // Pin gpu_slot with token 0, then unmap gpu_slot so it enters deferred_unmaps while held.
+    assert_eq!(unsafe { map(gpu_slot, 1, &tokens[0]) }, gpu_slot);
+    let (mut addr, mut hold) = (0u64, 0u64);
+    assert_eq!(
+        unsafe { acquire_physical_backing(gpu_slot.addr() as u64, PAGE as u64, &mut addr, &mut hold) },
+        1
+    );
+    assert_eq!(addr, gpu_slot.addr() as u64);
+    assert_ne!(hold, 0);
+    assert_eq!(unsafe { map(gpu_slot, 1, ptr::null()) }, gpu_slot);
+
+    // Map token 1 into the CPU view, then reuse held gpu_slot for token 1 (SecondaryAlias).
+    assert_eq!(unsafe { map(cpu_view, 1, &tokens[1]) }, cpu_view);
+    assert_eq!(unsafe { map(gpu_slot, 1, &tokens[1]) }, gpu_slot);
+
+    let info = query(gpu_slot.addr());
+    assert_eq!(info.State, M_COMMIT);
+    assert_eq!(info.Protect, PAGE_READWRITE);
+
+    release_physical_backing(hold);
+    assert_eq!(unsafe { map(gpu_slot, 1, ptr::null()) }, gpu_slot);
+    assert_eq!(unsafe { map(cpu_view, 1, ptr::null()) }, cpu_view);
+    assert_eq!(unsafe { free(2, tokens.as_ptr()) }, 1);
+    assert_ne!(unsafe { VirtualFree(gpu_slot, 0, MEM_RELEASE) }, 0);
+    assert_ne!(unsafe { VirtualFree(cpu_view, 0, MEM_RELEASE) }, 0);
+}
+
+#[test]
+fn deferred_unmapped_held_page_returns_invalid_address_not_not_found() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut token = 0u64;
+    let mut count = 1usize;
+    assert_eq!(unsafe { allocate(super::super::FLAGS, &mut count, &mut token) }, 1);
+
+    let aperture = reserve_aperture(1);
+    assert!(!aperture.is_null());
+    assert_eq!(unsafe { map(aperture, 1, &token) }, aperture);
+
+    let (mut addr, mut hold) = (0u64, 0u64);
+    assert_eq!(
+        unsafe { acquire_physical_backing(aperture.addr() as u64, PAGE as u64, &mut addr, &mut hold) },
+        1
+    );
+    assert_ne!(hold, 0);
+
+    // Unmap while held: page remains committed in `deferred_unmaps` until `hold` drops.
+    // Re-acquiring that unmapped aperture page must fail with ERROR_INVALID_ADDRESS,
+    // never ERROR_NOT_FOUND (which would trick d3d12 into an unpinned direct import).
+    assert_eq!(unsafe { map(aperture, 1, ptr::null()) }, aperture);
+    let (mut second_addr, mut second_hold) = (0u64, 0u64);
+    assert_eq!(
+        unsafe {
+            acquire_physical_backing(
+                aperture.addr() as u64,
+                PAGE as u64,
+                &mut second_addr,
+                &mut second_hold,
+            )
+        },
+        0
+    );
+    assert_eq!(unsafe { GetLastError() }, ERROR_INVALID_ADDRESS);
+
+    release_physical_backing(hold);
+    // An unmapped page in a live XMem aperture also fails with ERROR_INVALID_ADDRESS,
+    // not ERROR_NOT_FOUND.
+    assert_eq!(unsafe { map(aperture, 1, &token) }, aperture);
+    assert_eq!(unsafe { map(aperture, 1, ptr::null()) }, aperture);
+    assert_eq!(unsafe { free(1, &token) }, 1);
+    assert_ne!(unsafe { VirtualFree(aperture, 0, MEM_RELEASE) }, 0);
+}
+
+#[test]
+fn resolve_backings_does_not_coalesce_across_private_view_and_shared_section() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut tokens = [0u64; 2];
+    let mut count = 2usize;
+    assert_eq!(unsafe { allocate(super::super::FLAGS, &mut count, tokens.as_mut_ptr()) }, 1);
+
+    let span = reserve_aperture(2);
+    let alias = reserve_aperture(1);
+    assert!(!span.is_null() && !alias.is_null());
+
+    // Map [t0, t1] contiguously into `span`, then map a second CPU view of `t1`
+    // and touch it so `t1` promotes to SharedSection while `t0` stays PrivateView.
+    assert_eq!(unsafe { map(span, 2, tokens.as_ptr()) }, span);
+    unsafe { span.cast::<u32>().write(0x1111_0000) };
+    assert_eq!(unsafe { map(alias, 1, &tokens[1]) }, alias);
+    unsafe { alias.cast::<u32>().write(0x2222_0000) };
+
+    assert_eq!(query(span.addr()).Type, MEM_PRIVATE);
+    assert_ne!(query(span.addr() + PAGE).Type, MEM_PRIVATE);
+
+    let mut runs = [BackingRun { address: 0, bytes: 0 }; 4];
+    let mut run_count = 4u32;
+    let mut hold = 0u64;
+    assert_eq!(
+        unsafe {
+            acquire_physical_backing_runs(
+                span.addr() as u64,
+                (2 * PAGE) as u64,
+                runs.as_mut_ptr(),
+                &mut run_count,
+                &mut hold,
+            )
+        },
+        1
+    );
+    assert_eq!(run_count, 2, "PrivateView and SharedSection must remain separate runs");
+    assert_eq!(runs[0], BackingRun { address: span.addr() as u64, bytes: PAGE as u64 });
+    assert_eq!(runs[1], BackingRun { address: (span.addr() + PAGE) as u64, bytes: PAGE as u64 });
+
+    release_physical_backing(hold);
+    assert_eq!(unsafe { map(alias, 1, ptr::null()) }, alias);
+    assert_eq!(unsafe { map(span, 2, ptr::null()) }, span);
+    assert_eq!(unsafe { free(2, tokens.as_ptr()) }, 1);
+    assert_ne!(unsafe { VirtualFree(alias, 0, MEM_RELEASE) }, 0);
+    assert_ne!(unsafe { VirtualFree(span, 0, MEM_RELEASE) }, 0);
+}

@@ -544,3 +544,116 @@ fn scattered_alias_imports_through_reserved_buffer_and_aliases_cpu_and_gpu() {
     });
     drop(xmem);
 }
+
+#[test]
+fn placed_resource_keeps_backing_hold_alive_after_imported_heap_drops() {
+    let Some(device) = hardware_device() else { return };
+    let home = Region::private(PAGE as usize);
+    let guest = Region::reserved(PAGE as usize);
+    let xmem = FakeXmem::install(&[(guest.address(), home.address())]);
+
+    let pools = PagePools::default();
+    let backing = acquire(guest.address(), PAGE).unwrap();
+    let pin = GPU_APERTURE.pin(guest.address(), PAGE).unwrap();
+    let heap_first = pools.import(&device, guest.address(), backing, PAGE, pin, "test", false).unwrap();
+    let via_first = placed(&device, &heap_first.native);
+    super::super::attach_import(&via_first, &heap_first).unwrap();
+
+    drop(heap_first);
+    assert_eq!(
+        RELEASED.load(Ordering::Acquire),
+        0,
+        "placed resource must keep the BackingGuard hold alive through ID3D12Heap"
+    );
+
+    drop(via_first);
+    assert_eq!(RELEASED.load(Ordering::Acquire), 1);
+    drop(xmem);
+}
+
+#[test]
+fn adjacent_placeholder_private_spans_import_check() {
+    use windows::Win32::System::Memory::{
+        MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE_PLACEHOLDER,
+        VIRTUAL_FREE_TYPE, VirtualAlloc2,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    let Some(device) = hardware_device() else { return };
+    let process = unsafe { GetCurrentProcess() };
+    let base = unsafe {
+        VirtualAlloc2(
+            Some(process),
+            None,
+            (2 * PAGE) as usize,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            PAGE_NOACCESS.0,
+            None,
+        )
+    };
+    assert!(!base.is_null());
+    unsafe { VirtualFree(base, PAGE as usize, VIRTUAL_FREE_TYPE(MEM_RELEASE.0 | MEM_PRESERVE_PLACEHOLDER.0)) }.unwrap();
+    let page0 = unsafe {
+        VirtualAlloc2(
+            Some(process),
+            Some(base),
+            PAGE as usize,
+            MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+            PAGE_READWRITE.0,
+            None,
+        )
+    };
+    assert_eq!(page0, base);
+    let page1_addr = unsafe { base.cast::<u8>().add(PAGE as usize) };
+    let page1 = unsafe {
+        VirtualAlloc2(
+            Some(process),
+            Some(page1_addr.cast()),
+            PAGE as usize,
+            MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+            PAGE_READWRITE.0,
+            None,
+        )
+    };
+    assert_eq!(page1, page1_addr.cast());
+
+    let p0_words = unsafe { core::slice::from_raw_parts_mut(page0.cast::<u32>(), 4) };
+    let p1_words = unsafe { core::slice::from_raw_parts_mut(page1.cast::<u32>(), 4) };
+    p0_words.copy_from_slice(&[0x1010_0001, 0x1010_0002, 0x1010_0003, 0x1010_0004]);
+    p1_words.copy_from_slice(&[0x2020_0001, 0x2020_0002, 0x2020_0003, 0x2020_0004]);
+
+    let heap = unsafe { device.OpenExistingHeapFromAddress1::<ID3D12Heap>(page0, (2 * PAGE) as usize) }
+        .expect("adjacent placeholder PrivateSpans import as one heap");
+    let mut res: Option<ID3D12Resource> = None;
+    unsafe {
+        device.CreatePlacedResource(
+            &heap,
+            0,
+            &buffer_desc(2 * PAGE),
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut res,
+        )
+    }
+    .unwrap();
+    let res = res.unwrap();
+    let readback = committed(&device, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    submit(&device, |list| unsafe {
+        list.CopyBufferRegion(&readback, 0, &res, 0, 16);
+        list.CopyBufferRegion(&readback, 16, &res, PAGE, 16);
+    });
+    let mut out = core::ptr::null_mut();
+    unsafe { readback.Map(0, None, Some(&mut out)) }.unwrap();
+    let seen = unsafe { core::slice::from_raw_parts(out.cast::<u32>(), 8) };
+    assert_eq!(
+        seen,
+        &[
+            0x1010_0001, 0x1010_0002, 0x1010_0003, 0x1010_0004,
+            0x2020_0001, 0x2020_0002, 0x2020_0003, 0x2020_0004,
+        ]
+    );
+    drop((res, readback, heap));
+
+    let _ = unsafe { VirtualFree(page0, 0, MEM_RELEASE) };
+    let _ = unsafe { VirtualFree(page1, 0, MEM_RELEASE) };
+}

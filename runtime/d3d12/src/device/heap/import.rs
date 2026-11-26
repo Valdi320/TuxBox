@@ -23,40 +23,51 @@ pub(super) fn trace_import_failure(source: &'static str, api: &'static str, size
 
 // This holder is also the key for the weak single-page import cache. Its
 // last native resource releases both the heap reference and the VA pin.
-// Field order is load-bearing: `native` and `extra_heaps` must drop before
-// `_shadow` unmaps and before `_backing` lets XMem unmap the imported memory.
+// Native heaps own their `BackingGuard` (`ShadowPages` + `Hold`) via
+// `SetPrivateDataInterface`, so the host memory stays pinned until every
+// native heap reference (including vkd3d-proton's internal `resource->heap`
+// during resource destruction) is released.
 pub(in super::super) struct ImportedHeap {
     pub(super) native: ID3D12Heap,
     extra_heaps: Vec<ID3D12Heap>,
     pub(super) _pin: ImportPin,
-    _shadow: Option<Arc<super::shadow::ShadowPages>>,
-    _backing: Option<super::backing::Hold>,
     // The host memory the heap was imported from (or mirrors).
     memory: u64,
 }
 
 impl ImportedHeap {
-    pub(super) fn direct(native: ID3D12Heap, pin: ImportPin, backing: super::backing::Backing) -> Self {
-        Self { native, extra_heaps: Vec::new(), _pin: pin, _shadow: None, _backing: backing.hold, memory: backing.address }
+    pub(super) fn direct(
+        native: ID3D12Heap,
+        pin: ImportPin,
+        backing: super::backing::Backing,
+    ) -> windows::core::Result<Self> {
+        if let Some(guard) = BackingGuard::new(None, backing.hold) {
+            attach_heap_guard(&native, &guard)?;
+        }
+        Ok(Self { native, extra_heaps: Vec::new(), _pin: pin, memory: backing.address })
     }
 
-    pub(super) fn shadowed(native: ID3D12Heap, pin: ImportPin, shadow: Arc<super::shadow::ShadowPages>,
-        backing: super::backing::Backing) -> Self {
-        Self { native, extra_heaps: Vec::new(), _pin: pin, _shadow: Some(shadow), _backing: backing.hold, memory: backing.address }
+    pub(super) fn shadowed(
+        native: ID3D12Heap,
+        pin: ImportPin,
+        shadow: Arc<super::shadow::ShadowPages>,
+        backing: super::backing::Backing,
+    ) -> windows::core::Result<Self> {
+        if let Some(guard) = BackingGuard::new(Some(shadow), backing.hold) {
+            attach_heap_guard(&native, &guard)?;
+        }
+        Ok(Self { native, extra_heaps: Vec::new(), _pin: pin, memory: backing.address })
     }
 
     pub(super) fn scattered(
         native: ID3D12Heap,
         extra_heaps: Vec<ID3D12Heap>,
         pin: ImportPin,
-        hold: super::backing::Hold,
     ) -> Self {
         Self {
             native,
             extra_heaps,
             _pin: pin,
-            _shadow: None,
-            _backing: Some(hold),
             memory: 0,
         }
     }
@@ -84,9 +95,9 @@ pub(super) fn import_scattered_buffer(
     check_mirror: bool,
 ) -> windows::core::Result<(ID3D12Resource, Arc<ImportedHeap>)> {
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
-    // Declare `_hold` before `heaps` and `resource` so error drops release
-    // `resource`, then `heaps`, and `_hold` last.
-    let _hold = hold;
+    // Declare `guard` before `heaps` and `resource` so error drops release
+    // `resource`, then `heaps`, and local `guard` last.
+    let guard = BackingGuard::new(None, Some(hold)).expect("hold present");
     let granularity = u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
     if offset != 0
         || runs.len() < 2
@@ -122,6 +133,7 @@ pub(super) fn import_scattered_buffer(
                 trace_import_failure(source, "scattered-sized", run.bytes, error.code());
                 error
             })?;
+        attach_heap_guard(&native, &guard)?;
         let tiles = u32::try_from(run.bytes / granularity).map_err(|_| E_INVALIDARG)?;
         heaps.push((native, tiles));
     }
@@ -144,7 +156,7 @@ pub(super) fn import_scattered_buffer(
     let mut iter = heaps.into_iter().map(|(heap, _)| heap);
     let primary = iter.next().expect("scattered runs validated >= 2");
     let extra_heaps: Vec<ID3D12Heap> = iter.collect();
-    let heap = Arc::new(ImportedHeap::scattered(primary, extra_heaps, pin, _hold));
+    let heap = Arc::new(ImportedHeap::scattered(primary, extra_heaps, pin));
     if let Err(error) = attach_import(&resource, &heap) {
         drop(resource);
         return Err(error);
@@ -233,7 +245,7 @@ pub(in super::super) fn import_buffer_with_heap(
                 trace_import_failure(source, "legacy", size, error.code());
                 error
             })?;
-            Arc::new(ImportedHeap::direct(native, pin, backing))
+            Arc::new(ImportedHeap::direct(native, pin, backing)?)
         }
     };
     let mut resource = None;

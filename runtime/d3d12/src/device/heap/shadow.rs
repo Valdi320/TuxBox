@@ -293,7 +293,7 @@ pub(super) fn open_shadow_sized(
     })?;
     register(&shadow);
     log_first_mirror();
-    Ok(Arc::new(ImportedHeap::shadowed(native, pin, shadow, backing)))
+    Ok(Arc::new(ImportedHeap::shadowed(native, pin, shadow, backing)?))
 }
 
 pub(super) fn open_shadow_legacy(
@@ -311,7 +311,7 @@ pub(super) fn open_shadow_legacy(
     })?;
     register(&shadow);
     log_first_mirror();
-    Ok(Arc::new(ImportedHeap::shadowed(native, pin, shadow, backing)))
+    Ok(Arc::new(ImportedHeap::shadowed(native, pin, shadow, backing)?))
 }
 
 #[cfg(test)]
