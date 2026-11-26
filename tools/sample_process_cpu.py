@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sample a running Linux game's process and thread CPU usage independently of graphics presents."""
+"""Sample Linux game CPU and memory pressure independently of graphics presents."""
 import argparse
 import json
 import os
@@ -13,6 +13,43 @@ def stat(path):
     name = raw[raw.index(b"(") + 1:end].decode(errors="replace")
     fields = raw[end + 2:].split()  # task state is field 3 in proc_pid_stat(5)
     return name, int(fields[19]), int(fields[11]) + int(fields[12])
+
+
+def memory_fields(path, wanted):
+    """Read selected procfs KiB fields; missing or invalid values stay unknown."""
+    values = dict.fromkeys(wanted)
+    try:
+        for line in path.read_text().splitlines():
+            name, sep, body = line.partition(":")
+            if not sep or name not in wanted:
+                continue
+            fields = body.split()
+            if len(fields) == 2 and fields[1] == "kB":
+                try:
+                    value = int(fields[0])
+                except ValueError:
+                    continue
+                if value >= 0:
+                    values[name] = value
+    except OSError:
+        pass
+    return values
+
+
+def memory_sample(proc, meminfo=Path("/proc/meminfo")):
+    host = memory_fields(meminfo, ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree"))
+    task = memory_fields(proc / "status", ("VmRSS", "VmHWM", "VmSwap"))
+    total, free = host["SwapTotal"], host["SwapFree"]
+    return {
+        "host_available_kib": host["MemAvailable"],
+        "host_total_kib": host["MemTotal"],
+        "host_swap_total_kib": total,
+        "host_swap_free_kib": free,
+        "host_swap_used_kib": total - free if total is not None and free is not None and total >= free else None,
+        "process_rss_kib": task["VmRSS"],
+        "process_peak_rss_kib": task["VmHWM"],
+        "process_swap_kib": task["VmSwap"],
+    }
 
 
 def snapshot(proc):
@@ -59,6 +96,7 @@ def sample(pid, seconds, interval, output):
             "host_busy_percent": (round(100 * (1 - (idle - previous[4]) / host_ticks), 2)
                                   if host_ticks > 0 else None),
             "threads": sorted(active, key=lambda thread: thread["cpu_ticks"], reverse=True),
+            "memory": memory_sample(proc),
         }
         output.write(json.dumps(row, separators=(",", ":")) + "\n")
         output.flush()

@@ -315,9 +315,25 @@ pub(super) fn prepared(shader: &[u8]) -> Option<Vec<u8>> {
 
 /// A shader may receive its root signature only at pipeline creation. Include
 /// the actual signature in the compiler request and cache key for that variant.
-pub(super) fn compute_with_root(shader: &[u8], root: &[u8]) -> Option<Vec<u8>> {
+pub(super) struct ComputeTranslation {
+    pub code: Vec<u8>,
+    pub request: String,
+}
+
+pub(super) fn prepared_compute(shader: &[u8]) -> Option<ComputeTranslation> {
     let (Stage::Compute, ShaderCode::Xbox) = shader_code(shader)? else { return None };
-    translate(&with_root(shader, root)?, Stage::Compute)
+    translate_compute(shader)
+}
+
+fn translate_compute(shader: &[u8]) -> Option<ComputeTranslation> {
+    let request = source_digest(shader)?;
+    let code = translate_keyed(shader, Stage::Compute, &request)?;
+    Some(ComputeTranslation { code, request })
+}
+
+pub(super) fn compute_with_root(shader: &[u8], root: &[u8]) -> Option<ComputeTranslation> {
+    let (Stage::Compute, ShaderCode::Xbox) = shader_code(shader)? else { return None };
+    translate_compute(&with_root(shader, root)?)
 }
 
 /// Whether the translator refused this program on this root only for want of
@@ -343,11 +359,11 @@ pub(super) fn superseded(shader: &[u8], root: &[u8]) {
 /// embedded root is the pipeline root needs the ordinary prepared translation;
 /// any other program must use the actual pipeline root (never silently fall
 /// back to a rootless variant or to a different embedded root).
-pub(super) fn compute_for_original_root(shader: &[u8], root: &[u8]) -> Option<Vec<u8>> {
+pub(super) fn compute_for_original_root(shader: &[u8], root: &[u8]) -> Option<ComputeTranslation> {
     let dxbc = tuxbox_dxbc::Dxbc::parse(shader).ok()?;
     let embedded = dxbc.chunk(b"RTS0").and_then(|c| shader.get(c.offset..c.offset + c.size));
     if embedded == Some(root) {
-        prepared(shader)
+        prepared_compute(shader)
     } else {
         compute_with_root(shader, root)
     }
@@ -543,10 +559,14 @@ pub(super) fn mesh_stage(
 
 fn translate(shader: &[u8], stage: Stage) -> Option<Vec<u8>> {
     let source = source_digest(shader)?;
-    let translation = read_portable("by_source", &source, stage)
-        .or_else(|| compile::on_demand(shader, &source, stage));
-    stage.report(&source, translation.is_some());
-    crate::failures::lookup(stage.short(), &source, translation.is_some());
+    translate_keyed(shader, stage, &source)
+}
+
+fn translate_keyed(shader: &[u8], stage: Stage, source: &str) -> Option<Vec<u8>> {
+    let translation = read_portable("by_source", source, stage)
+        .or_else(|| compile::on_demand(shader, source, stage));
+    stage.report(source, translation.is_some());
+    crate::failures::lookup(stage.short(), source, translation.is_some());
     if stage == Stage::Compute && let Some(code) = translation.as_deref() {
         narrow_waves::remember(code, shader);
     }

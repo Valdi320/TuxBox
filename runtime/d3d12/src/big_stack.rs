@@ -356,6 +356,9 @@ impl PipelineWatch {
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let started = std::time::Instant::now();
         flights().push(Flight { id, label: label.to_string(), started, next_due: 5 });
+        if request_trace(label) {
+            crate::diagnostics::log(&format!("CreatePipelineState #{id} {label} started"));
+        }
         Self { id: Some(id), label: label.to_string(), started }
     }
 }
@@ -365,13 +368,21 @@ impl Drop for PipelineWatch {
         let Some(id) = self.id else { return };
         let elapsed = self.started.elapsed().as_secs();
         flights().retain(|flight| flight.id != id);
-        if elapsed >= 5 {
+        if elapsed >= 5 || request_trace(&self.label) {
             crate::diagnostics::log(&format!(
                 "CreatePipelineState #{id} {} finished in {elapsed}s",
                 self.label
             ));
         }
     }
+}
+
+// Opt-in for short, successful pipeline calls too. Ordinary diagnostics
+// continue to report only slow calls, now with exact request attribution.
+fn request_trace(label: &str) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    label.starts_with("CS ") && label.contains(" request=")
+        && *ENABLED.get_or_init(|| std::env::var("TUXBOX_TRACE_PIPELINE_REQUESTS").as_deref() == Ok("1"))
 }
 
 fn flights() -> std::sync::MutexGuard<'static, Vec<Flight>> {

@@ -860,3 +860,33 @@ unless the staged file matches the local build. This does not rebuild or
 replace a DLL, prove which source revision produced the local build, or
 inspect modules actually loaded by Wine. Record the build revision and
 driver separately.
+
+### Identify a slow slot-62 compute pipeline request
+
+With diagnostic logging enabled, slow `CreatePipelineState #N CS ...`
+messages include `request=<key> bytes=<size>`. The short CS hash still
+identifies the original guest program, while the full request key names
+the actual selected translation (`<key>.cso` in the shader cache), including
+a root-specific request or its `_w32` variant. `request=original` means the
+original bytecode was passed to the host, not a translated cache entry.
+Set `TUXBOX_TRACE_PIPELINE_REQUESTS=1` to also record starts and finishes of
+short attempts. The identifier after `#` is local to the process.
+Times include any compile-slot wait and the host pipeline call; they do not
+isolate the driver. This currently covers the Xbox slot-62 compute factory,
+not all graphics or pipeline-stream paths. Share keys and sizes only, not
+title shader files or private raw logs.
+
+
+To test the memory-pressure hypothesis in issue #231, sample the actual
+guest process (not the UMU parent) during the cold launch:
+
+```sh
+python tools/sample_process_cpu.py PID --seconds 300 --interval 1 --output cold-memory.jsonl
+```
+
+The samples share the existing UTC nanosecond timestamp and include host
+available RAM, total/free/used swap, guest RSS, peak RSS and guest swap in
+KiB. Missing fields are null. Compare timestamps with the pipeline log;
+neither a large swap value nor a slow pipeline alone establishes causation.
+The sampler does not attribute host memory to individual driver threads.
+Keep detailed samples local; share aggregate memory observations.

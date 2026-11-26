@@ -223,7 +223,7 @@ unsafe fn create_pipeline_x_inner(
             // root and fills only the slots the appended signature adds.
             let mut table = table;
             let mut code = super::shader_cache::compute_with_root(bytes, table.layout.payload())
-                .or_else(|| super::shader_cache::prepared(bytes));
+                .or_else(|| super::shader_cache::prepared_compute(bytes));
             // A heap-indexed IDXEN access needs each slot's buffer stride: retry
             // on the same root with the arena's stride table appended.
             if code.is_none() && super::shader_cache::refused_for_heap_strides(bytes, table.layout.payload())
@@ -296,7 +296,7 @@ unsafe fn create_pipeline_x_inner(
                         };
                         (Some(code), None)
                     }
-                    _ => (super::shader_cache::prepared(bytes).or_else(|| {
+                    _ => (super::shader_cache::prepared_compute(bytes).or_else(|| {
                         super::shader_cache::compute_with_root(bytes, root?.state.payload())
                     }), None),
                 },
@@ -304,11 +304,17 @@ unsafe fn create_pipeline_x_inner(
         }
     };
     let compute_threads = guest_threads
-        .or_else(|| translation.as_deref().and_then(tuxbox_dxbc::shader_compute_threads));
+        .or_else(|| translation.as_ref().and_then(|t| tuxbox_dxbc::shader_compute_threads(&t.code)));
     // The group size above is the console's. A narrow-wave translation runs the
     // same group on half as many host threads, so it is chosen only now.
-    let translation = translation.map(|code| fitting_translation(this, code));
-    let code = translation.as_deref().unwrap_or(bytes);
+    let translation = translation.map(|mut translated| {
+        if let Some((code, request)) = narrow_translation(this, &translated.code) {
+            translated.code = code;
+            translated.request = request;
+        }
+        translated
+    });
+    let code = translation.as_ref().map_or(bytes, |t| t.code.as_slice());
     if let Some(refusal) = unsupported_wave_size(this, code) {
         crate::diagnostics::compute_wave_failure(bytes, &refusal.detail);
         crate::failures::refusal("CS", &refusal.tag);
@@ -319,7 +325,7 @@ unsafe fn create_pipeline_x_inner(
         match super::compute_scene::private_root(
             &this.native,
             bytes,
-            translated,
+            &translated.code,
             root.map(|p| &p.state),
             desc.NodeMask,
         ) {
@@ -329,9 +335,9 @@ unsafe fn create_pipeline_x_inner(
     } else {
         None
     };
-    let label = super::shader_cache::source_digest(bytes)
-        .map(|hash| format!("CS {}", &hash[..8]))
-        .unwrap_or_else(|| "CS".to_string());
+    let source = super::shader_cache::source_digest(bytes);
+    let label = compute_compile_label(source.as_deref(), translation.as_ref().map(|t| t.request.as_str()), code.len());
+    let original_label = compute_compile_label(source.as_deref(), None, bytes.len());
     let mut host = D3D12_COMPUTE_PIPELINE_STATE_DESC {
         pRootSignature: ManuallyDrop::new(
             scene_root
@@ -353,14 +359,14 @@ unsafe fn create_pipeline_x_inner(
     // The driver compile must own its device, root signature, and shader bytes:
     // a deadline can return while that compile is still writing the GPU cache.
     let signature = core::mem::ManuallyDrop::into_inner(host.pRootSignature.clone());
-    let compile = |shader: &[u8]| {
+    let compile = |shader: &[u8], label: &str| {
         let device = this.native.clone();
         let signature = signature.clone();
         let shader = shader.to_vec();
         let node_mask = desc.NodeMask;
         let flags = desc.Flags;
-        let name = label.clone();
-        crate::big_stack::run_deadline(&label, move || {
+        let name = label.to_owned();
+        crate::big_stack::run_deadline(label, move || {
             // Large programs queue here so the driver does not compile them
             // all at once. The queue is on the detached compile thread, so the
             // title's own thread still returns at the deadline.
@@ -389,7 +395,7 @@ unsafe fn create_pipeline_x_inner(
             owned_compile(device, signature, shader, node_mask, flags)
         })
     } else {
-        match compile(code) {
+        match compile(code, &label) {
             crate::big_stack::PipelineWait::Ready(result) => result,
             crate::big_stack::PipelineWait::Deferred => {
                 // The original guest shader would be a second long driver compile.
@@ -402,7 +408,7 @@ unsafe fn create_pipeline_x_inner(
     if translation.is_some() && reflected.is_none() && scene_root.is_none() && native.is_err() {
         // Structural checks cannot validate DXIL instructions or root bindings.
         // Let the adapter handle the original guest shader if it rejects the cache.
-        native = match compile(bytes) {
+        native = match compile(bytes, &original_label) {
             crate::big_stack::PipelineWait::Ready(result) => result,
             crate::big_stack::PipelineWait::Deferred => {
                 crate::failures::refusal("CS", "driver compile deadline");
@@ -556,11 +562,26 @@ pub(super) fn check_wave_range(required: (u32, u32), host: (u32, u32)) -> Option
 /// `translation`, or the narrow-wave translation of the same program when this
 /// host cannot run it and the compiler can produce one.
 pub(super) fn fitting_translation(device: &Device, translation: Vec<u8>) -> Vec<u8> {
-    let Some(host) = super::host_profile::wave_range(device) else { return translation };
-    if !needs_narrow_waves(super::shader_cache::portable_wave_range(&translation), host) {
-        return translation;
+    narrow_translation(device, &translation).map(|(code, _)| code).unwrap_or(translation)
+}
+
+fn narrow_translation(device: &Device, translation: &[u8]) -> Option<(Vec<u8>, String)> {
+    let host = super::host_profile::wave_range(device)?;
+    if !needs_narrow_waves(super::shader_cache::portable_wave_range(translation), host) {
+        return None;
     }
-    super::shader_cache::narrow_wave_variant(&translation).unwrap_or(translation)
+    super::shader_cache::narrow_wave_variant(translation)
+}
+
+/// Keep the familiar short guest hash, but identify the exact compiler
+/// request selected for this attempt, including rooted and narrow variants.
+/// A retry with original guest bytes must never name a translated cache file.
+fn compute_compile_label(source: Option<&str>, request: Option<&str>, bytes: usize) -> String {
+    let short = source.and_then(|s| s.get(..8)).unwrap_or("unknown");
+    match request {
+        Some(key) => format!("CS {short} request={key} bytes={bytes}"),
+        None => format!("CS {short} request=original bytes={bytes}"),
+    }
 }
 
 /// Whether a program that needs exactly 64 lanes meets a host that has fewer.

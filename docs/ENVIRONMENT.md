@@ -46,6 +46,7 @@ The launcher sets these for a Proton or Wine launch. A value you set yourself is
 | `TUXBOX_SHADER_PREP_UI` | on for ProjectScarlett | `1` shows a desktop progress window |
 | `TUXBOX_SCARLETT_SEED_PACK` | off | `1` prepares every shader in `shaders.rpf` |
 | `TUXBOX_LARGE_COMPILES` | Automatic (1–4) | Large compute pipelines compiling at once; the automatic policy uses available memory, reserving 2 GiB plus 2 GiB per compile, and always permits one compile. If the memory query fails, use four. An explicit number overrides the policy; `0` removes the limit. |
+| `TUXBOX_TRACE_PIPELINE_REQUESTS` | `0` | With diagnostic logging enabled, also log start and completion of short slot-62 compute pipeline attempts, including the selected shader cache request key and byte size |
 | `TUXBOX_PIPELINE_DEADLINE` | `20` | Seconds before a large compile gets an empty stand-in; `0` waits |
 | `TUXBOX_NULL_PIPELINES` | on | `0` fails unsupported pipelines instead of giving empty stand-ins |
 | `TUXBOX_PROGRESS_OVERLAY` | `auto` | `always` or `0` for the progress panel |
