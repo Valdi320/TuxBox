@@ -217,24 +217,24 @@ pub(in crate::hlsl) fn lower_first_lane_reads(insns: &mut [Insn]) {
 /// In particular, a vector read after the spill requires a new whole-word
 /// definition, and no vector definition can overlap the spill lifetime.
 /// Other encodings (including implicit wide operands) retain the refusal.
-fn disjoint_spill_lifetimes(insns: &[Insn], v: u8) -> bool {
+fn disjoint_spill_lifetimes(insns: &[Insn], v: u8) -> Result<(), &'static str> {
     let lane = |i: &Insn| i.enc == Enc::Vop3 && matches!(i.op, 0x360 | 0x361);
     let touches = |i: &Insn| i.dst.contains(&Opnd::Vgpr(v)) || i.src.contains(&Opnd::Vgpr(v));
     let spill = |i: &Insn| lane(i) && (if i.op == 0x361 {
         i.dst.first() == Some(&Opnd::Vgpr(v))
     } else { i.src.first() == Some(&Opnd::Vgpr(v)) });
-    let Some(first) = insns.iter().position(spill) else { return false; };
-    let Some(last) = insns.iter().rposition(spill) else { return false; };
+    let Some(first) = insns.iter().position(spill) else { return Err("missing_lane_site"); };
+    let Some(last) = insns.iter().rposition(spill) else { return Err("missing_lane_site"); };
     let mut redefined = false;
     for (n, i) in insns.iter().enumerate() {
         if lane(i) {
             // A writelane must have a scalar value; a readlane only reads
             // the named vector, and its encoded destination is scalar.
             if i.op == 0x361 && !matches!(i.src.first(), Some(Opnd::Sgpr(0..=105) | Opnd::ConstInt(_) | Opnd::Literal(_))) {
-                return false;
+                return Err("non_scalar_lane_value");
             }
             if i.op == 0x360 && !matches!(i.dst.as_slice(), [Opnd::Vgpr(0..=105) | Opnd::Sgpr(0..=105)]) {
-                return false;
+                return Err("invalid_lane_destination");
             }
             continue;
         }
@@ -245,14 +245,23 @@ fn disjoint_spill_lifetimes(insns: &[Insn], v: u8) -> bool {
             && !i.src.iter().any(|o| matches!(o, Opnd::Vgpr(_)));
         let export = i.enc == Enc::Exp;
         let nop = matches!(i.mnemonic.as_str(), "v_nop" | "s_nop" | "s_waitcnt" | "s_endpgm");
-        if !(plain_move || scalar_move || export || nop) { return false; }
+        if !(plain_move || scalar_move || export || nop) {
+            return Err(match i.enc {
+                Enc::Sopp => "control_flow_or_special",
+                Enc::Sop1 | Enc::Sop2 | Enc::Sopk | Enc::Sopc => "scalar_operation",
+                Enc::Smem => "scalar_memory",
+                Enc::Vop1 | Enc::Vop2 | Enc::Vop3 | Enc::Vopc => "vector_operation",
+                Enc::Vinterp => "interpolation",
+                _ => "other_encoding",
+            });
+        }
         if nop || !touches(i) { continue; }
         if n < first { continue; }
-        if n <= last { return false; }
-        if i.src.contains(&Opnd::Vgpr(v)) && !redefined { return false; }
+        if n <= last { return Err("overlapping_vector_access"); }
+        if i.src.contains(&Opnd::Vgpr(v)) && !redefined { return Err("missing_full_redefinition"); }
         if plain_move && i.dst == [Opnd::Vgpr(v)] { redefined = true; }
     }
-    true
+    Ok(())
 }
 
 pub(in crate::hlsl) fn lower_lane_spills(insns: &mut [Insn], wave32: bool, group_reads: bool) -> Result<(), String> {
@@ -278,10 +287,11 @@ pub(in crate::hlsl) fn lower_lane_spills(insns: &mut [Insn], wave32: bool, group
             _ => None,
         })
         .collect();
-    let disjoint: BTreeSet<_> = any_written.iter().copied()
+    let mixed: BTreeMap<_, _> = any_written.iter().copied()
         .filter(|&v| insns.iter().any(|i| !is_lane(i) && i.mnemonic != "v_nop"
             && i.dst.iter().chain(&i.src).any(|o| *o == Opnd::Vgpr(v))))
-        .filter(|&v| disjoint_spill_lifetimes(insns, v)).collect();
+        .map(|v| (v, disjoint_spill_lifetimes(insns, v))).collect();
+    let disjoint: BTreeSet<_> = mixed.iter().filter_map(|(&v, result)| result.is_ok().then_some(v)).collect();
     for ins in insns.iter_mut() {
         if !is_lane(ins) {
             continue;
@@ -381,6 +391,11 @@ pub(in crate::hlsl) fn lower_lane_spills(insns: &mut [Insn], wave32: bool, group
         for o in ins.dst.iter().chain(ins.src.iter()) {
             if let Opnd::Vgpr(v) = o {
                 if spill_vregs.contains(v) && !disjoint.contains(v) {
+                    if std::env::var("TUXBOX_PIXEL_PROOF_AUDIT").as_deref() == Ok("1") {
+                        let reason = mixed.get(v).and_then(|r| r.as_ref().err()).copied()
+                            .unwrap_or("post_rewrite_overlap");
+                        eprintln!("TB_PIXEL_PROOF spill {reason}");
+                    }
                     return Err(format!("v{v} is used both as a lane spill area and as a vector at {:#x}", ins.offset));
                 }
             }

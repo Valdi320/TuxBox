@@ -89,3 +89,25 @@ fn waterfall_scalar_leftovers_must_be_dead() {
     let mut ops = waterfall_words(&[0xbe90_0380, 0x8001_8110]);
     assert_eq!(lower_waterfall_gathers(&mut ops), 1);
 }
+
+#[test]
+fn mixed_spill_proof_reports_reason_without_changing_acceptance() {
+    let words: [u32; 13] = [0x7f000287, 0x7e080380, 0xbe8c0393,
+                 0xd7610080, 0x0201000c, 0xd760000d, 0x02010180,
+                 0x7f000297, 0x7e0a0380, 0x7e0c020d,
+                 0xf800080f, 0x80060504, 0xbf810000];
+    let decode = |words: &[u32]| {
+        let bytes: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        crate::rdna2::disassemble(&bytes)
+    };
+    assert_eq!(disjoint_spill_lifetimes(&decode(&words), 128), Ok(()));
+    let mut bad = words.to_vec();
+    bad.remove(7);
+    assert_eq!(disjoint_spill_lifetimes(&decode(&bad), 128), Err("missing_full_redefinition"));
+    let mut bad = words.to_vec();
+    bad.insert(5, 0x7f000297);
+    assert_eq!(disjoint_spill_lifetimes(&decode(&bad), 128), Err("overlapping_vector_access"));
+    let mut bad = words.to_vec();
+    bad.insert(7, 0xbf840001);
+    assert_eq!(disjoint_spill_lifetimes(&decode(&bad), 128), Err("control_flow_or_special"));
+}

@@ -24,7 +24,7 @@ def snapshot_request(source, directory):
                 raise ValueError("pixel order must be portable pixel DXIL")
             (dest / name).write_bytes(data)
     else:
-        expected = source.stem.split("_rt")[0]
+        expected = source.stem.split("_rt")[0].removesuffix("_w32")
         dest.write_bytes(verified_input(source, expected))
     return dest
 

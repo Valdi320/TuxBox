@@ -100,15 +100,32 @@ pub(super) fn inputs(ex: &ShaderExtract, insns: &[Insn]) -> Vec<Param> {
     // Some programs preserve only a subset of unused full-register
     // interpolants. Never guess which ones: require a unique ordered layout
     // consistent with the hardware count and all actual interpolation reads.
-    count.and_then(|n| unique_full_layout(&all, sig, &reads, n)).unwrap_or(preferred)
+    let proof = count.ok_or("missing_hardware_count")
+        .and_then(|n| unique_full_layout_reason(&all, sig, &reads, n));
+    match proof {
+        Ok(layout) => layout,
+        Err(reason) => {
+            if ex.stage == crate::Stage::Pixel && std::env::var("TUXBOX_PIXEL_PROOF_AUDIT").as_deref() == Ok("1") {
+                eprintln!("TB_PIXEL_PROOF attrs {reason}");
+            }
+            preferred
+        }
+    }
 }
 
+#[cfg(test)]
 fn unique_full_layout(all: &[Param], sig: &[SigElement],
                       reads: &BTreeSet<(usize, usize, Option<bool>)>, count: usize) -> Option<Vec<Param>> {
-    if all.len() > 64 || count > all.len() || all.iter().any(|p| !matches!(p, Param::Full(_)))
-        || reads.iter().any(|&(a, _, h)| a >= count || h.is_some()) {
-        return None;
-    }
+    unique_full_layout_reason(all, sig, reads, count).ok()
+}
+
+fn unique_full_layout_reason(all: &[Param], sig: &[SigElement],
+                      reads: &BTreeSet<(usize, usize, Option<bool>)>, count: usize) -> Result<Vec<Param>, &'static str> {
+    if all.len() > 64 { return Err("signature_limit"); }
+    if count > all.len() { return Err("count_exceeds_signature"); }
+    if all.iter().any(|p| !matches!(p, Param::Full(_))) { return Err("packed_half_layout"); }
+    if reads.iter().any(|&(a, _, _)| a >= count) { return Err("attribute_outside_count"); }
+    if reads.iter().any(|&(_, _, h)| h.is_some()) { return Err("half_read"); }
     let required = |i: usize| {
         let Param::Full(register) = all[i] else { unreachable!() };
         sig.iter().any(|e| e.register == register && e.rw_mask != 0)
@@ -127,7 +144,11 @@ fn unique_full_layout(all: &[Param], sig: &[SigElement],
             ways[i][j] = (skip + keep).min(2);
         }
     }
-    if ways[0][0] != 1 { return None; }
+    match ways[0][0] {
+        0 => return Err("no_layout"),
+        1 => {},
+        _ => return Err("ambiguous_layout"),
+    }
     let mut result = Vec::new();
     for i in 0..all.len() {
         let j = result.len();
@@ -135,7 +156,7 @@ fn unique_full_layout(all: &[Param], sig: &[SigElement],
             result.push(all[i].clone());
         }
     }
-    Some(result)
+    Ok(result)
 }
 
 /// Parameter, channel and half (`None` for the whole channel) of each interpolation.

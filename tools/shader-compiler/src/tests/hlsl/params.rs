@@ -33,3 +33,19 @@ fn partial_layout_requires_unique_count_and_channel_evidence() {
     assert_eq!(unique_full_layout(&all, &sig, &BTreeSet::from([(0, 0, Some(false))]), 3), None);
     assert_eq!(unique_full_layout(&[Param::Half(vec![(1, 0)])], &sig, &BTreeSet::new(), 1), None);
 }
+
+#[test]
+fn partial_layout_reports_distinct_failed_proofs() {
+    let mut sig = [element(0, 3, 1), element(1, 3, 1), element(2, 3, 1), element(3, 3, 1)];
+    sig[0].rw_mask = 0;
+    sig[2].rw_mask = 0;
+    let all = assign(&sig, &[], |_| true);
+    let r = BTreeSet::from([(0, 0, None), (2, 0, None)]);
+    assert!(unique_full_layout_reason(&all, &sig, &r, 3).is_ok());
+    assert_eq!(unique_full_layout_reason(&all, &sig, &BTreeSet::from([(2, 0, None)]), 3), Err("ambiguous_layout"));
+    assert_eq!(unique_full_layout_reason(&all, &sig, &r, 2), Err("attribute_outside_count"));
+    assert_eq!(unique_full_layout_reason(&all, &sig, &BTreeSet::from([(0, 1, None)]), 3), Err("no_layout"));
+    assert_eq!(unique_full_layout_reason(&all, &sig, &r, 5), Err("count_exceeds_signature"));
+    assert_eq!(unique_full_layout_reason(&all, &sig, &BTreeSet::from([(0, 0, Some(false))]), 3), Err("half_read"));
+    assert_eq!(unique_full_layout_reason(&[Param::Half(vec![(1, 0)])], &sig, &BTreeSet::new(), 1), Err("packed_half_layout"));
+}
