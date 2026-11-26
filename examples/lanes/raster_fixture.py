@@ -89,7 +89,28 @@ MESH_SAMPLER_PIXEL_RESOURCES = (*SAMPLER_PIXEL_RESOURCES, [1, 0, 1, 1])
 MESH_USER = ([0, 0, 1, 501, 0x200],)
 MESH_USED = ([2, 0, 501, 0, 0x2_0004],)
 MESH_RESOURCES = ([2, 0, 501, 501],)
-MESH_CODE = (0xBF810000,)  # s_endpgm: the desktop replacement runs instead
+# Synthetic RDNA2 NGG, 67 vertices, a guarded FP16-to-FP32 position export.
+# Assembled from tools.check_translated_mesh_gpu.program(67, half=True).
+MESH_CODE = (
+    0xd7650000, 0x020100c1, 0x7e000505, 0x9381ff03, 0x00040018, 0xd7660000,
+    0x020200c1, 0x900a8700, 0xd7460001, 0x04010c01, 0xbe9403ff, 0x00000043,
+    0x7e2802ff, 0x80000000, 0x7e3602ff, 0x04210440, 0x7d840280, 0x02283714,
+    0x7d8402ff, 0x00000042, 0xd5010015, 0x01a9fef3, 0x40400000, 0x7d8402ff,
+    0x00000041, 0xd5010016, 0x01a9fef3, 0x40400000, 0x7e2e02f0, 0x7e3002f2,
+    0xbeac047e, 0x7da80214, 0xbf880002, 0x7e0e1515, 0x7e0e1707, 0xbefe042c,
+    0xbf068014, 0x8580807e, 0xb5940080, 0x8582807e, 0x88800000, 0x88820202,
+    0x88800002, 0xd501000a, 0x00010280, 0x7e00050a, 0x87000081, 0xbf068100,
+    0xbe80047e, 0x8582807e, 0xd501000b, 0x00090214, 0x8984c102, 0x7e0c050b,
+    0x7da40280, 0xbf88000d, 0x8f078c06, 0x8aea027e, 0x88060607, 0xbefc0306,
+    0xbf900009, 0xbf8c0000, 0xbf870006, 0xbf8a0000, 0x7e147081, 0xf80008c0,
+    0x00000000, 0xf8000941, 0x0000000a, 0xbf8cff0f, 0xbefe0400, 0xbf8a0000,
+    0x7d880214, 0x8780046a, 0xbe862400, 0xbf880012, 0xd548000c, 0x02291514,
+    0xd548000d, 0x02292914, 0x361c28ff, 0x000003ff, 0x7d861814, 0xd4c30002,
+    0x00021a14, 0xd4c30000, 0x00021c14, 0x8882026a, 0x88800200, 0xd501000f,
+    0x0001ff14, 0x80000000, 0xf8000941, 0x0000000f, 0xbf8cff0f, 0xbefe0406,
+    0x7d880214, 0x8780046a, 0xbe802400, 0xbf880002, 0xf80008cf, 0x18171607,
+    0xbf810000,
+)
 
 ABSENT = 0xDEADBEEFDEADBEEF
 ROWS_AT, CODE_AT = 0x240, 0x280
@@ -183,10 +204,14 @@ def mesh_sampler_pixel():
 
 
 def mesh():
-    """The records-only console mesh program (shader model 6.5, stage 13)."""
+    """Synthetic NGG mesh program with guarded FP16 position (stage 13)."""
+    info = bytearray(validation(13, MESH_RESOURCES))
+    info[31] = 2
+    struct.pack_into("<HH", info, 16, 128, 128)
+    struct.pack_into("<3I", info, 40, 128, 1, 1)
     return container(0xD0065, image(2, MESH_CODE, MESH_USER, MESH_USED), [
         (b"OSGN", signature([("SV_Position", 0, 1, 3, 0, 15, 0)])),
-        (b"PSV0", validation(13, MESH_RESOURCES)),
+        (b"PSV0", info),
     ])
 
 

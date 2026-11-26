@@ -103,6 +103,10 @@ class RasterFixtureTests(unittest.TestCase):
         self.assertNotIn(b"RTS0", mesh)
         self.assertEqual(struct.unpack_from("<I", mesh[b"DXIL"], 0)[0] >> 16, 13)
         self.assertEqual(mesh[b"PSV0"][28], 13)
+        self.assertEqual(mesh[b"PSV0"][31], 2)
+        self.assertEqual(struct.unpack_from("<HH", mesh[b"PSV0"], 16), (128, 128))
+        self.assertEqual(struct.unpack_from("<3I", mesh[b"PSV0"], 40), (128, 1, 1))
+        self.assertGreater(len(raster_fixture.MESH_CODE), 1)
         program = fssm(mesh[b"DXIL"])
         self.assertEqual(rows(program, 0xe8, 0xf8), [[0, 0, 1, 501, 0x200]])
         self.assertEqual(rows(program, 0xf0, 0xfc), [[2, 0, 501, 0, 0x2_0004]])
@@ -150,14 +154,8 @@ class RasterGateTests(unittest.TestCase):
                                "problem": log_check, "mesh": mesh_cso.exists()}
                 return {}
 
-            def run_tool(command, **_):
-                # The mesh program's desktop translation, compiled into the prepared cache.
-                seen["mesh_command"] = [str(part) for part in command]
-                Path(command[command.index("-Fo") + 1]).write_bytes(b"")
-
             with mock.patch("project_tuxbox.runtime_shaders.shader_session", session), \
-                    mock.patch("project_tuxbox.shader_prep.compiler_tools", lambda: ("xshader", "dxc", "dxv")), \
-                    mock.patch("project_tuxbox.shader_prep.run_tool", run_tool):
+                    mock.patch("project_tuxbox.shader_prep.run_tool", side_effect=AssertionError("desktop mesh preparation is forbidden")):
                 lanes_raster_tables(SimpleNamespace(env=env), check, ["--adapter", "10de:2c02"], "10de:2c02", ())
             seen["calls"] = list(calls)
             seen.update(calls[f"lanes-{scenario}"])
@@ -200,23 +198,27 @@ class RasterGateTests(unittest.TestCase):
         # The two-table trace names another pipeline.
         self.assertIn("did not create", self.run_gate(self.TRACE, [], "raster-samplers")[0]["problem"])
 
-    def test_mesh_draw_prepares_its_mesh_and_needs_the_mesh_pipeline(self):
+    def test_mesh_draw_requires_both_runtime_translations(self):
+        mesh, pixel = "a"*64, "b"*64
         mesh_trace = ("created Xbox mesh pipeline (680-byte stream, amplification=false)\n"
-                      f"created raster pipeline with {verify_module.MESH_SAMPLER_SLOTS} reflected FSSM descriptor slots\n")
-        seen, rootless = self.run_gate(mesh_trace, [], "mesh-samplers")
+                      f"created raster pipeline with {verify_module.MESH_SAMPLER_SLOTS} reflected FSSM descriptor slots\n"
+                      f"prepared mesh shader loaded, source SHA-256 {mesh}\n"
+                      f"prepared pixel shader loaded, source SHA-256 {pixel}\n")
+        seen, rootless = self.run_gate(mesh_trace, [mesh, pixel], "mesh-samplers")
         self.assertEqual(seen["arguments"][:2], ["--selftest", "mesh-samplers"])
         self.assertIsNone(seen["problem"])
-        # Only this scenario has the prepared mesh translation, and it is removed after.
-        self.assertEqual(seen["mesh"], True)
+        self.assertFalse(seen["mesh"])
         self.assertEqual(seen["calls"], ["lanes-raster-tables", "lanes-raster-samplers", "lanes-mesh-samplers", "lanes-mesh-sampler-single"])
-        self.assertEqual(seen["mesh_command"][1:5], ["-T", "ms_6_5", "-E", "main"])
-        self.assertTrue(seen["mesh_command"][-1].endswith("examples/lanes/mesh_samplers.hlsl"))
         self.assertEqual(seen["left"], ["title.cso"])
-        # No mesh pipeline, a stand-in, or the pixel program's root-less translation fail.
         self.assertIn("mesh pipeline", self.run_gate(trace(1), [], "mesh-samplers")[0]["problem"])
         self.assertIn("stand-in", self.run_gate(mesh_trace + "substituted null raster stream pipeline\n", [],
                                                 "mesh-samplers")[0]["problem"])
         self.assertIn("without its root", self.run_gate(mesh_trace, [rootless[3]], "mesh-samplers")[0]["problem"])
+        self.assertIn("missing worker receipt for loaded mesh", self.run_gate(mesh_trace, [pixel], "mesh-samplers")[0]["problem"])
+        self.assertIn("missing worker receipt for loaded pixel", self.run_gate(mesh_trace, [mesh], "mesh-samplers")[0]["problem"])
+        seen, _ = self.run_gate(mesh_trace, [mesh, pixel], "mesh-sampler-single")
+        self.assertIsNone(seen["problem"])
+        self.assertFalse(seen["mesh"])
 
     def test_scenario_runs_only_under_the_worker(self):
         self.assertNotIn("raster-tables", LANES_SCENARIOS)

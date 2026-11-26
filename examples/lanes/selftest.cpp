@@ -785,7 +785,7 @@ void raster_samplers(ID3D12Device* device) {
 // pixel program against it. Without that the provider falls back to the pixel
 // program's root-less translation, whose private sampler the root lacks: the
 // pipeline becomes a stand-in and the target keeps its clear value. The mesh
-// program's desktop translation is prepared before launch (`mesh_samplers.hlsl`).
+// program is translated by the same runtime shader worker.
 void mesh_samplers(ID3D12Device* device) {
     const D3D12_STATIC_SAMPLER_DESC points[]{point_sampler(0), point_sampler(1)};
     auto root = two_table_root(device, points, UINT(std::size(points)));
@@ -2181,7 +2181,7 @@ std::string run_selftest(const wchar_t* requested, const wchar_t* adapter) {
     for (const auto& scenario : scenarios) {
         if (!all && std::wcscmp(requested, scenario.name)) continue;
         // This one writes nothing until the launcher's compiler has translated it,
-        // and mesh-samplers needs its mesh program's translation prepared first.
+        // and mesh-samplers needs its root-aware runtime shader worker.
         if (all && (!std::wcscmp(scenario.name, L"wave64-shader") || !std::wcsncmp(scenario.name, L"mesh-sampler", 12)))
             continue;
         const auto name = narrow(scenario.name);
