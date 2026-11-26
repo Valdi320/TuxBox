@@ -16,3 +16,20 @@ fn half_registers_share_parameters_by_channel() {
     assert_eq!(params[2].channel(5, 2), Some((2, Some(false))));
     assert_eq!(params[3].channel(6, 3), Some((3, None)));
 }
+
+#[test]
+fn partial_layout_requires_unique_count_and_channel_evidence() {
+    let mut sig = [element(0, 3, 1), element(1, 3, 1), element(2, 3, 1), element(3, 3, 1)];
+    sig[0].rw_mask = 0;
+    sig[2].rw_mask = 0;
+    let all = assign(&sig, &[], |_| true);
+    let reads = BTreeSet::from([(0, 0, None), (2, 0, None)]);
+    assert_eq!(unique_full_layout(&all, &sig, &reads, 3),
+        Some(vec![Param::Full(1), Param::Full(2), Param::Full(3)]));
+    // Reading only the final slot cannot distinguish the two unused inputs.
+    assert_eq!(unique_full_layout(&all, &sig, &BTreeSet::from([(2, 0, None)]), 3), None);
+    assert_eq!(unique_full_layout(&all, &sig, &reads, 2), None);
+    assert_eq!(unique_full_layout(&all, &sig, &BTreeSet::from([(0, 1, None), (2, 0, None)]), 3), None);
+    assert_eq!(unique_full_layout(&all, &sig, &BTreeSet::from([(0, 0, Some(false))]), 3), None);
+    assert_eq!(unique_full_layout(&[Param::Half(vec![(1, 0)])], &sig, &BTreeSet::new(), 1), None);
+}

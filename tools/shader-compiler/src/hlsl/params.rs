@@ -90,10 +90,52 @@ pub(super) fn inputs(ex: &ShaderExtract, insns: &[Insn]) -> Vec<Param> {
     let count = ex.fssm.get(0x238..).and_then(|b| b.first_chunk()).map(|b| u32::from_le_bytes(*b) as usize);
     let paired: Vec<Param> = all.iter().filter(|p| p.registers().into_iter().any(read)).cloned().collect();
     let reads = reads(insns);
-    let mut fits: Vec<_> = [used.clone(), paired, all].into_iter().filter(|p| Some(p.len()) == count).collect();
+    let mut fits: Vec<_> = [used.clone(), paired, all.clone()].into_iter().filter(|p| Some(p.len()) == count).collect();
     // The first of equals.
     fits.sort_by_key(|p| reads.iter().filter(|&&r| !carries(p, sig, r)).count());
-    fits.into_iter().next().unwrap_or(used)
+    let preferred = fits.into_iter().next().unwrap_or(used);
+    if reads.iter().all(|&r| carries(&preferred, sig, r)) {
+        return preferred;
+    }
+    // Some programs preserve only a subset of unused full-register
+    // interpolants. Never guess which ones: require a unique ordered layout
+    // consistent with the hardware count and all actual interpolation reads.
+    count.and_then(|n| unique_full_layout(&all, sig, &reads, n)).unwrap_or(preferred)
+}
+
+fn unique_full_layout(all: &[Param], sig: &[SigElement],
+                      reads: &BTreeSet<(usize, usize, Option<bool>)>, count: usize) -> Option<Vec<Param>> {
+    if all.len() > 64 || count > all.len() || all.iter().any(|p| !matches!(p, Param::Full(_)))
+        || reads.iter().any(|&(a, _, h)| a >= count || h.is_some()) {
+        return None;
+    }
+    let required = |i: usize| {
+        let Param::Full(register) = all[i] else { unreachable!() };
+        sig.iter().any(|e| e.register == register && e.rw_mask != 0)
+    };
+    let allowed = |i: usize, j: usize| {
+        reads.iter().filter(|r| r.0 == j)
+            .all(|&(_, channel, half)| carries(&all[i..i+1], sig, (0, channel, half)))
+    };
+    // Number of completions, saturated at two. No exponential search.
+    let mut ways = vec![vec![0u8; count + 1]; all.len() + 1];
+    ways[all.len()][count] = 1;
+    for i in (0..all.len()).rev() {
+        for j in (0..=count).rev() {
+            let skip = if required(i) { 0 } else { ways[i+1][j] };
+            let keep = if j < count && allowed(i, j) { ways[i+1][j+1] } else { 0 };
+            ways[i][j] = (skip + keep).min(2);
+        }
+    }
+    if ways[0][0] != 1 { return None; }
+    let mut result = Vec::new();
+    for i in 0..all.len() {
+        let j = result.len();
+        if j < count && allowed(i, j) && ways[i+1][j+1] == 1 {
+            result.push(all[i].clone());
+        }
+    }
+    Some(result)
 }
 
 /// Parameter, channel and half (`None` for the whole channel) of each interpolation.
