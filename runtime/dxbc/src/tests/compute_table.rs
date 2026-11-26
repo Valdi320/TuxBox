@@ -226,3 +226,53 @@ fn same_register_at_two_slots_fails_closed() {
     assert_eq!(corroborated_descriptor(&image, &resources, 5, 5, 0x320), None);
     assert_eq!(corroborated_descriptor(&image, &resources, 5, 5, 0x340), None);
 }
+
+#[test]
+fn third_compute_table_can_recover_corroborated_missing_descriptors() {
+    // Third table is s6. The root has a raw SRV at slot zero but
+    // leaves slot two uncovered. Metadata identifies the missing binding.
+    let mut root = three_tables_srv_constants();
+    root.params[2].kind = RootParamKind::Table(vec![RootRange {
+        range_type: 0, num: 1, base_register: 0, space: 0, offset_in_table: 0,
+    }]);
+    for (class, width, shape, ty, kind) in [
+        (0x300, 4, 1, 4, 0), (0x303, 4, 1, 7, 1),
+        (0x302, 4, 0, 2, 2), (0x300, 8, 0, 3, 0),
+        (0x303, 8, 0, 6, 1),
+    ] {
+        let user = [[3, 16, 1, 28, 0x206]];
+        let used = [[class, 16, 28, shape, 0x20600 | width]];
+        let image = program(&user, &used);
+        let resources = [[ty, 1, 28, 28]];
+        assert_eq!(uncovered_descriptor(&image, &resources, 5, 6, 64, &root),
+                   Some((kind, 28, 1)), "class={class:#x} width={width}");
+        let shader = raster_shader(5, &user, &used, &resources);
+        assert_eq!(missing_root_descriptors(&shader, &root),
+                   vec![Binding { table: 2, kind, register: 28, space: 1, slot: 2 }]);
+        let mut bad = root.clone();
+        bad.params[2].kind = RootParamKind::Constants { register: 28, space: 1, num32: 1 };
+        assert_eq!(uncovered_descriptor(&image, &resources, 5, 6, 64, &bad), None);
+        let bad = program(&[[3,16,1,28,0x106]], &[[class,16,28,shape,0x10600|width]]);
+        assert_eq!(uncovered_descriptor(&bad, &resources, 5, 6, 64, &root), None);
+    }
+}
+
+#[test]
+fn uncovered_bindings_do_not_collide_with_root_descriptor_names() {
+    for (class, root_kind, ty, kind, shape) in [
+        (0x300, 3, 4, 0, 1), (0x303, 4, 7, 1, 1), (0x302, 2, 2, 2, 0)
+    ] {
+        let image = program(&[[3, 16, 1, 28, 0x105]], &[[class, 16, 28, shape, 0x10504]]);
+        let resources = [[ty, 1, 28, 28]];
+        let mut root = root(vec![]);
+        root.params.push(RootParam { visibility: 0, kind: RootParamKind::Descriptor {
+            kind: root_kind, register: 28, space: 1,
+        }});
+        assert_eq!(uncovered_descriptor(&image, &resources, 5, 5, 64, &root),
+                   Some((kind, 2, 32701)));
+        root.params.push(RootParam { visibility: 0, kind: RootParamKind::Descriptor {
+            kind: root_kind, register: 2, space: 32701,
+        }});
+        assert_eq!(uncovered_descriptor(&image, &resources, 5, 5, 64, &root), None);
+    }
+}

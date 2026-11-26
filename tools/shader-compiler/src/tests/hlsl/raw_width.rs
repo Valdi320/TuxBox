@@ -502,3 +502,40 @@ fn compute_root_srv_remapping_requires_unambiguous_metadata() {
         assert!(super::translate(&ex).is_err(), "translated invalid case {variant}");
     }
 }
+
+#[test]
+fn third_compute_table_recovers_a_proven_atomic_uav() {
+    use crate::meta::{RootParam, RootParamKind, RootRange};
+    // s_load_dwordx4 s[16:19], s[6:7], 0x40; buffer_atomic_add v4,v5,s[16:19],0 offen
+    let words = [0xf4080403u32, 0xfa000040, 0xe0c81000, 0x80040405, 0xbf810000];
+    let isa: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    let mut ex = super::mesh::heap_extract(&[[3,16,1,0,0x206]], 0, &isa);
+    ex.stage = Stage::Compute;
+    ex.psv_threads = Some([64,1,1]);
+    ex.required_features = None;
+    let used_at = (ex.fssm.len() - 16) as u64;
+    ex.fssm[0xf0..0xf8].copy_from_slice(&used_at.to_le_bytes());
+    ex.fssm[0xfc..0x100].copy_from_slice(&1u32.to_le_bytes());
+    ex.fssm.extend([0x303u32,16,0,1,0x20604].into_iter().flat_map(u32::to_le_bytes));
+    let size = (ex.fssm.len()-16) as u32;
+    ex.fssm[8..12].copy_from_slice(&size.to_le_bytes());
+    ex.resources.push(crate::psv::PsvResource { res_type: 7, space: 0, lower: 0, upper: 0 });
+    let root = ex.root_sig.as_mut().unwrap();
+    root.version = 2;
+    root.params = (0..3).map(|_| RootParam { visibility: 0, kind: RootParamKind::Table(vec![
+        RootRange { range_type: 0, num: 1, base_register: 0, space: 0, offset_in_table: 0 },
+    ]) }).collect();
+    let hlsl = super::translate(&ex).unwrap().hlsl;
+    assert!(hlsl.contains("RWByteAddressBuffer raw_ubuf0 : register(u0)"), "{hlsl}");
+    assert!(hlsl.contains("raw_ubuf0.InterlockedAdd("), "{hlsl}");
+    println!("BEGIN_HLSL\n{hlsl}\nEND_HLSL");
+    // A real SRV occupying this slot is not evidence that an atomic can write it.
+    let RootParamKind::Table(ranges) = &mut ex.root_sig.as_mut().unwrap().params[2].kind else { unreachable!() };
+    ranges[0].num = 3;
+    assert!(super::translate(&ex).is_err());
+    // An uncovered slot without the independent user-data record is refused.
+    let RootParamKind::Table(ranges) = &mut ex.root_sig.as_mut().unwrap().params[2].kind else { unreachable!() };
+    ranges[0].num = 1;
+    ex.fssm[0xf8..0xfc].fill(0);
+    assert!(super::translate(&ex).is_err());
+}
