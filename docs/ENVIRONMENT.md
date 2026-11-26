@@ -143,3 +143,14 @@ can overlap. Missing host profiling or a missing trace is represented by null,
 not zero. The separate preparation aggregate remains in the launch log.
 Keep the raw timeline and detailed pipeline summary local; the combined
 aggregate does not include title or shader identifiers.
+
+### Concurrent content reuse
+
+Cold shader requests that translate to identical HLSL and the same target
+profile share a single DXC compilation across launcher processes using the
+same toolchain cache. Exact source cache hits still bypass compilation and
+locking. Different HLSL or target profiles compile independently. A failed
+compile does not publish an unsupported marker for another source; the next
+request can retry. Content locks are retained as empty files to avoid races
+with other processes. The wait is bounded by the maximum compiler fallback
+budget plus validation and scheduling margin.
