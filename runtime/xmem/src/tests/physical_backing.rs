@@ -531,3 +531,71 @@ fn resolve_backings_does_not_coalesce_across_private_view_and_shared_section() {
     assert_ne!(unsafe { VirtualFree(alias, 0, MEM_RELEASE) }, 0);
     assert_ne!(unsafe { VirtualFree(span, 0, MEM_RELEASE) }, 0);
 }
+
+#[test]
+fn arena_hold_cpu_alias_coherence_probe() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut token = 0u64;
+    let mut count = 1usize;
+    assert_eq!(unsafe { allocate(super::super::FLAGS, &mut count, &mut token) }, 1);
+    let initial = reserve_aperture(1);
+    let gpu = reserve_aperture(1);
+    let cpu = reserve_aperture(1);
+    assert_eq!(unsafe { map(initial, 1, &token) }, initial);
+    unsafe { initial.cast::<u32>().write(0x1234_5678); }
+    let range = PageRange { mode: 0, source: 0, count: 1 };
+    let batch = Batch { destination: gpu.addr(), count: 1, ranges: &range };
+    assert_eq!(unsafe { copy_page_mappings(1, &batch, initial.addr(), 1) }, 0);
+    assert_eq!(unsafe { map(initial, 1, ptr::null()) }, initial);
+    let (mut backing, mut hold) = (0u64, 0u64);
+    assert_eq!(unsafe { acquire_physical_backing(gpu.addr() as u64, PAGE as u64, &mut backing, &mut hold) }, 1);
+    assert_ne!(backing, gpu.addr() as u64);
+    assert_eq!(query(backing as usize).Type, MEM_PRIVATE);
+    assert_eq!(unsafe { (backing as *const u32).read() }, 0x1234_5678);
+    assert_eq!(unsafe { map(cpu, 1, &token) }, cpu);
+    // Trigger lazy promotion, then simulate a later write to the still-held host backing.
+    let before = unsafe { cpu.cast::<u32>().read() };
+    unsafe { (backing as *mut u32).write(0xaabb_ccdd); }
+    let after = unsafe { cpu.cast::<u32>().read() };
+    let kind = query(cpu.addr()).Type;
+    release_physical_backing(hold);
+    assert_eq!(unsafe { map(cpu, 1, ptr::null()) }, cpu);
+    assert_eq!(unsafe { free(1, &token) }, 1);
+    for a in [initial,gpu,cpu] { assert_ne!(unsafe { VirtualFree(a,0,MEM_RELEASE) },0); }
+    eprintln!("cpu type={kind:#x}, before={before:#x}, after={after:#x}");
+    assert_eq!(before, 0x1234_5678);
+    assert_eq!(after, 0xaabb_ccdd, "live arena hold and CPU alias lost coherence");
+}
+
+#[test]
+fn arena_release_before_alias_promotion_control() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut token = 0u64;
+    let mut count = 1usize;
+    assert_eq!(unsafe { allocate(super::super::FLAGS, &mut count, &mut token) }, 1);
+    let initial = reserve_aperture(1);
+    let gpu = reserve_aperture(1);
+    let cpu = reserve_aperture(1);
+    assert_eq!(unsafe { map(initial, 1, &token) }, initial);
+    unsafe { initial.cast::<u32>().write(0x1234_5678); }
+    let range = PageRange { mode: 0, source: 0, count: 1 };
+    let batch = Batch { destination: gpu.addr(), count: 1, ranges: &range };
+    assert_eq!(unsafe { copy_page_mappings(1, &batch, initial.addr(), 1) }, 0);
+    assert_eq!(unsafe { map(initial, 1, ptr::null()) }, initial);
+    let (mut backing, mut hold) = (0u64, 0u64);
+    assert_eq!(unsafe { acquire_physical_backing(gpu.addr() as u64, PAGE as u64, &mut backing, &mut hold) }, 1);
+    assert_ne!(backing, gpu.addr() as u64);
+    unsafe { (backing as *mut u32).write(0xaabb_ccdd); }
+    // Control: retire the backing hold before the CPU alias can promote.
+    release_physical_backing(hold);
+    assert_eq!(unsafe { map(cpu, 1, &token) }, cpu);
+    assert_eq!(unsafe { cpu.cast::<u32>().read() }, 0xaabb_ccdd);
+    let (mut next, mut next_hold) = (0u64, 0u64);
+    assert_eq!(unsafe { acquire_physical_backing(gpu.addr() as u64, PAGE as u64, &mut next, &mut next_hold) }, 1);
+    unsafe { (next as *mut u32).write(0x55aa_55aa); }
+    assert_eq!(unsafe { cpu.cast::<u32>().read() }, 0x55aa_55aa);
+    release_physical_backing(next_hold);
+    assert_eq!(unsafe { map(cpu, 1, ptr::null()) }, cpu);
+    assert_eq!(unsafe { free(1, &token) }, 1);
+    for a in [initial,gpu,cpu] { assert_ne!(unsafe { VirtualFree(a,0,MEM_RELEASE) },0); }
+}
