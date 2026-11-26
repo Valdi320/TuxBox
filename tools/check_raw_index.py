@@ -20,6 +20,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 for name in ("hlsl", "provider", "proton", "prefix", "compiler-dir", "work", "output"):
     parser.add_argument("--" + name, type=Path, required=True)
 parser.add_argument("--adapter", required=True)
+parser.add_argument("--root-srv-remap", action="store_true", help="bind a real root SRV at t1, space3")
 args = parser.parse_args()
 w = args.work.resolve()
 w.mkdir(parents=True, exist_ok=True)
@@ -28,29 +29,42 @@ src=args.hlsl.read_text()
 def replace(s,a,b):
  assert s.count(a)==1,a
  return s.replace(a,b)
-src=replace(src,"ByteAddressBuffer raw_sbuf0 : register(t0);","ByteAddressBuffer raw_sbuf0 : register(t0);\nRWByteAddressBuffer output : register(u0);")
+if args.root_srv_remap:
+ src=replace(src,"ByteAddressBuffer raw_sbuf1 : register(t1, space3);","ByteAddressBuffer raw_sbuf1 : register(t1, space3);\nRWByteAddressBuffer output : register(u0);")
+else:
+ src=replace(src,"ByteAddressBuffer raw_sbuf0 : register(t0);","ByteAddressBuffer raw_sbuf0 : register(t0);\nRWByteAddressBuffer output : register(u0);")
 src=replace(src,"    v0 = gtid.x; v1 = gtid.y; v2 = gtid.z;","""    v0 = gtid.x; v1 = gtid.y; v2 = gtid.z;
     exec_lo = uint(gtid.x < 16u);
     if (exec_lo & 1u) {
         v2 = raw_sbuf0.Load(4u * gtid.x);
         v3 = raw_sbuf0.Load(4u * (16u + gtid.x));
     }""")
+if args.root_srv_remap:
+ src=src.replace("raw_sbuf0.Load(", "raw_sbuf1.Load(")
 for marker,offset in [("0x0020 buffer_load_dwordx4",0),("0x0028 s_endpgm",4)]:
  stores="".join(f"    if (exec_lo & 1u) output.Store(4u * (64u + 8u * gtid.x + {offset+k}u), v{4+k});\n" for k in range(4))
  src=replace(src,"    // "+marker,stores+"    // "+marker)
 guest=(p/"tools/reference/independent-shaders/compute.cpp").read_text()
-guest=replace(guest,"D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};","D3D12_DESCRIPTOR_RANGE range[]{{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 1}};")
-guest=replace(guest,"table.DescriptorTable = {1, &range};","table.DescriptorTable = {2, range};")
-guest=replace(guest,"D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,","D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,")
-guest=replace(guest,"    D3D12_COMMAND_QUEUE_DESC qd{};","""    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = DXGI_FORMAT_R32_TYPELESS;
-    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srv.Buffer = {first_byte / 4, view_bytes / 4, 0, D3D12_BUFFER_SRV_FLAG_RAW};
-    auto srv_handle = heap->GetCPUDescriptorHandleForHeapStart();
-    srv_handle.ptr += device->GetDescriptorHandleIncrementSize(hd.Type);
-    device->CreateShaderResourceView(seed.Get(), &srv, srv_handle);
-    D3D12_COMMAND_QUEUE_DESC qd{};""")
+if args.root_srv_remap:
+ guest=replace(guest,"D3D12_ROOT_SIGNATURE_DESC description{1, &table, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};", """D3D12_ROOT_PARAMETER parameters[2]{table, {}};
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[1].Descriptor = {1, 3};
+    D3D12_ROOT_SIGNATURE_DESC description{2, parameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};""")
+ guest=replace(guest,"    list->Dispatch(groups, 1, 1);", """    list->SetComputeRootShaderResourceView(1, seed->GetGPUVirtualAddress() + first_byte);
+    list->Dispatch(groups, 1, 1);""")
+else:
+ guest=replace(guest,"D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};","D3D12_DESCRIPTOR_RANGE range[]{{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 1}};")
+ guest=replace(guest,"table.DescriptorTable = {1, &range};","table.DescriptorTable = {2, range};")
+ guest=replace(guest,"D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,","D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,")
+ guest=replace(guest,"    D3D12_COMMAND_QUEUE_DESC qd{};","""    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+     srv.Format = DXGI_FORMAT_R32_TYPELESS;
+     srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+     srv.Buffer = {first_byte / 4, view_bytes / 4, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+     auto srv_handle = heap->GetCPUDescriptorHandleForHeapStart();
+     srv_handle.ptr += device->GetDescriptorHandleIncrementSize(hd.Type);
+     device->CreateShaderResourceView(seed.Get(), &srv, srv_handle);
+     D3D12_COMMAND_QUEUE_DESC qd{};""")
 rng=random.Random(0x53434152)
 def digest(data):return hashlib.sha256(data).hexdigest()
 proton=args.proton.resolve()
@@ -86,7 +100,7 @@ with TemporaryDirectory(dir=w) as td:
   actual=(trial/f"{name}.bin").read_bytes()
   assert actual==want,(name,[(i,a,b) for i,(a,b) in enumerate(zip(struct.unpack("<384I",actual),struct.unpack("<384I",want))) if a!=b][:10])
   rows.append({"case":name,"matched":True,"sha256":digest(actual)})
- receipt={"scope":"Synthetic translated IDXEN and IDXEN+OFFEN raw SRV loads; instrumented input and output only","adapter":fields["adapter"],"proton":(proton/"version").read_text().strip(),"cases":8,"compared_words":3072,"result_words":1024,"preserved_words":2048,"mismatches":0,"emitted_hlsl_sha256":digest(args.hlsl.read_bytes()),"instrumented_hlsl_sha256":digest(src.encode()),"dxil_sha256":digest(blob.read_bytes()),"guest_sha256":digest(exe.read_bytes()),"rows":rows}
+ receipt={"scope":"Synthetic translated IDXEN and IDXEN+OFFEN raw SRV loads; instrumented input and output only", "root_srv_remap":args.root_srv_remap,"adapter":fields["adapter"],"proton":(proton/"version").read_text().strip(),"cases":8,"compared_words":3072,"result_words":1024,"preserved_words":2048,"mismatches":0,"emitted_hlsl_sha256":digest(args.hlsl.read_bytes()),"instrumented_hlsl_sha256":digest(src.encode()),"dxil_sha256":digest(blob.read_bytes()),"guest_sha256":digest(exe.read_bytes()),"rows":rows}
  args.output.parent.mkdir(parents=True,exist_ok=True)
  args.output.write_text(json.dumps(receipt,indent=2)+"\n")
  print("PASS: 8 cases, 3072 words, 0 mismatches")
