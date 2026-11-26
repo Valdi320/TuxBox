@@ -11,7 +11,7 @@ import struct
 import tempfile
 
 from project_tuxbox.verify import (
-    headless_display, lanes_imports, missing_provider_imports, private_x_server, screen_capture_problem, xauthority_entry)
+    _free_display_number, headless_display, lanes_imports, missing_provider_imports, private_x_server, screen_capture_problem, xauthority_entry)
 
 
 class PrivateXServerTests(unittest.TestCase):
@@ -94,23 +94,82 @@ class HeadlessDisplayTests(unittest.TestCase):
                     self.assertEqual(host.env, env)
                 launch.assert_not_called()
 
-    def test_missing_xvfb_reports_the_actual_requirement(self):
+    def test_headless_start_requires_explicit_permission(self):
         host = SimpleNamespace(backend="proton", env={})
+        with mock.patch("project_tuxbox.verify.sys.platform", "linux"), \
+             mock.patch("project_tuxbox.verify.subprocess.Popen") as launch:
+            with self.assertRaisesRegex(ValueError, "opt in"):
+                with headless_display(host):
+                    self.fail("must not start server")
+            launch.assert_not_called()
+
+    def test_occupied_display_aliases_locks_and_abstract_sockets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            sockets = directory / ".X11-unix"
+            sockets.mkdir()
+            (sockets / "X100").touch()
+            (sockets / "X101_").touch()
+            (directory / ".X102-lock").touch()
+            (sockets / "X103").symlink_to(sockets / "missing")
+            table = directory / "unix"
+            table.write_text("Num RefCount Protocol Flags Type St Inode Path\n"
+                             f"000: 00000002 00000000 00010000 0001 01 1 @{sockets / 'X104'}\n"
+                             f"000: 00000002 00000000 00010000 0001 01 2 {sockets / 'X105_'}\n")
+            self.assertEqual(_free_display_number(100, 8, directory=directory, unix_table=table), 106)
+            self.assertIsNone(_free_display_number(100, 6, directory=directory, unix_table=table))
+            self.assertIsNone(_free_display_number(100, 8, directory=directory, unix_table=directory / "absent"))
+
+    def test_no_verified_free_display_does_not_launch(self):
+        host = SimpleNamespace(backend="proton", env={"TUXBOX_VERIFY_HEADLESS": "1"})
+        with mock.patch("project_tuxbox.verify.sys.platform", "linux"), \
+             mock.patch("project_tuxbox.verify.shutil.which", return_value="/usr/bin/Xvfb"), \
+             mock.patch("project_tuxbox.verify._free_display_number", return_value=None), \
+             mock.patch("project_tuxbox.verify.subprocess.Popen") as launch:
+            with self.assertRaisesRegex(ValueError, "No verifiably free"):
+                with headless_display(host):
+                    self.fail("must not start server")
+            launch.assert_not_called()
+
+    def test_explicit_number_must_match_server_receipt(self):
+        host = SimpleNamespace(backend="proton", env={"TUXBOX_VERIFY_HEADLESS": "1"})
+        with mock.patch("project_tuxbox.verify.sys.platform", "linux"), \
+             mock.patch("project_tuxbox.verify.shutil.which", return_value="/usr/bin/Xvfb"), \
+             mock.patch("project_tuxbox.verify._free_display_number", return_value=123), \
+             mock.patch("project_tuxbox.verify.subprocess.Popen") as launch, \
+             mock.patch("project_tuxbox.verify.select.select", return_value=([1], [], [])), \
+             mock.patch("project_tuxbox.verify.os.read", return_value=b"0\n"):
+            with self.assertRaisesRegex(ValueError, "did not acquire"):
+                with headless_display(host):
+                    self.fail("must not start guest")
+            self.assertEqual(launch.call_args.args[0][:2], ["/usr/bin/Xvfb", ":123"])
+            launch.return_value.terminate.assert_called_once()
+            self.assertNotIn("DISPLAY", host.env)
+
+    def test_missing_xvfb_reports_the_actual_requirement(self):
+        host = SimpleNamespace(backend="proton", env={"TUXBOX_VERIFY_HEADLESS": "1"})
         with mock.patch("project_tuxbox.verify.sys.platform", "linux"), \
              mock.patch("project_tuxbox.verify.shutil.which", return_value=None):
             with self.assertRaisesRegex(ValueError, "Headless guest checks need Xvfb"):
                 with headless_display(host):
                     self.fail("must not start guest checks")
 
-    @unittest.skipUnless(sys.platform == "linux" and shutil.which("Xvfb"), "requires Xvfb")
+    @unittest.skipUnless(sys.platform == "linux" and shutil.which("Xvfb")
+                         and os.environ.get("TUXBOX_TEST_HEADLESS_XVFB") == "1",
+                         "requires explicit TUXBOX_TEST_HEADLESS_XVFB=1 and Xvfb")
     def test_private_cookie_and_environment_cleanup_even_on_error(self):
-        host = SimpleNamespace(backend="proton", env={"XAUTHORITY": "/old"})
+        host = SimpleNamespace(backend="proton", env={"XAUTHORITY": "/old", "TUXBOX_VERIFY_HEADLESS": "1"})
+        def sockets():
+            paths = [*Path("/tmp/.X11-unix").glob("X*"), *Path("/tmp").glob(".X*-lock")]
+            return {p: (p.lstat().st_dev, p.lstat().st_ino, p.lstat().st_mode) for p in paths}
+        existing = sockets()
         before = os.environ.copy()
         with self.assertRaisesRegex(RuntimeError, "guest failed"):
             with headless_display(host):
                 display = host.env["DISPLAY"]
                 cookie = Path(host.env["XAUTHORITY"])
-                self.assertRegex(display, r"^:[0-9]+$")
+                self.assertRegex(display, r"^:1[0-9]{2}$")
+                self.assertEqual(existing, {p: sockets().get(p) for p in existing})
                 self.assertEqual(cookie.stat().st_mode & 0o777, 0o600)
                 self.assertIsNone(screen_capture_problem(display=display, xauthority=str(cookie)))
                 if shutil.which("xdpyinfo"):
@@ -120,7 +179,8 @@ class HeadlessDisplayTests(unittest.TestCase):
                     self.assertEqual(probe.returncode, 0, probe.stderr.decode(errors="replace"))
                 raise RuntimeError("guest failed")
         self.assertFalse(cookie.exists())
-        self.assertEqual(host.env, {"XAUTHORITY": "/old"})
+        self.assertEqual(host.env, {"XAUTHORITY": "/old", "TUXBOX_VERIFY_HEADLESS": "1"})
+        self.assertEqual(existing, {p: sockets().get(p) for p in existing})
         self.assertEqual(os.environ, before)
 
 

@@ -189,12 +189,22 @@ def xauthority_entry(cookie):
     return struct.pack(">H", 0xFFFF) + b"".join(struct.pack(">H", len(f)) + f for f in fields)
 
 
-def _free_display_number(start=2, attempts=16):
-    """Pick a display number free of lock files and sockets, or None."""
+def _free_display_number(start=2, attempts=16, *, directory=Path("/tmp"), unix_table=Path("/proc/net/unix")):
+    """Pick a display without a lock, pathname (including Hyprland's alias) or abstract socket."""
+    try:
+        # Abstract Unix-domain sockets may survive without a filesystem entry.
+        names = {fields[-1] for line in unix_table.read_text().splitlines()[1:]
+                 if len(fields := line.split(maxsplit=7)) == 8}
+    except OSError:
+        return None  # Cannot prove availability; fail closed.
     for candidate in range(start, start + attempts):
-        if Path(f"/tmp/.X{candidate}-lock").exists():
+        path = directory / ".X11-unix" / f"X{candidate}"
+        alias = path.with_name(path.name + "_")
+        lock = directory / f".X{candidate}-lock"
+        if any(os.path.lexists(p) for p in (path, alias, lock)):
             continue
-        if Path(f"/tmp/.X11-unix/X{candidate}").exists():
+        if any(name in names for p in (path, alias)
+               for name in (str(p), "@" + str(p))):
             continue
         return candidate
     return None
@@ -443,9 +453,16 @@ def headless_display(host):
             or host.env.get("DISPLAY") or host.env.get("WAYLAND_DISPLAY")):
         yield
         return
+    if host.env.get("TUXBOX_VERIFY_HEADLESS") != "1":
+        raise ValueError("No graphical session; supply DISPLAY or opt in with TUXBOX_VERIFY_HEADLESS=1")
     xvfb = shutil.which("Xvfb")
     if not xvfb:
         raise ValueError("Headless guest checks need Xvfb or an accessible graphical session")
+    # Never let -displayfd choose a number. Some rootless compositors own
+    # X<n>_ and/or an abstract socket even when X<n> appears absent.
+    display = _free_display_number(start=100, attempts=100)
+    if display is None:
+        raise ValueError("No verifiably free private Xvfb display in :100-:199")
     with tempfile.TemporaryDirectory(prefix="tuxbox-xvfb-") as directory:
         auth = Path(directory) / "Xauthority"
         descriptor = os.open(auth, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -453,7 +470,7 @@ def headless_display(host):
             stream.write(xauthority_entry(os.urandom(16)))
         read, write = os.pipe()
         try:
-            server = subprocess.Popen([xvfb, "-displayfd", str(write), "-screen", "0",
+            server = subprocess.Popen([xvfb, f":{display}", "-displayfd", str(write), "-screen", "0",
                                        "2560x1440x24", "-nolisten", "tcp", "-auth", str(auth)],
                                       pass_fds=(write,), stdin=subprocess.DEVNULL,
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -465,8 +482,8 @@ def headless_display(host):
         saved = {key: host.env.get(key) for key in ("DISPLAY", "XAUTHORITY")}
         try:
             number = os.read(read, 32) if select.select([read], [], [], 10)[0] else b""
-            if not number.strip().isdigit() or server.poll() is not None:
-                raise ValueError("Could not start the private Xvfb display")
+            if number.strip() != str(display).encode("ascii") or server.poll() is not None:
+                raise ValueError("Private Xvfb did not acquire the requested display")
             host.env.update(DISPLAY=f":{int(number)}", XAUTHORITY=str(auth))
             print(f"verify: private headless Xvfb display {host.env['DISPLAY']}", flush=True)
             yield
