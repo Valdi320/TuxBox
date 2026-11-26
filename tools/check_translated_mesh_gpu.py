@@ -21,10 +21,10 @@ from tools.frosty_gpu_guest import run_gpu_guest
 
 SRC = ROOT / "tools/reference/mesh"
 COUNTS = (3, 67, 128, 0, 129)
-CASES = tuple(f"{name}-{count}" for count in COUNTS for name in ("plain", "swizzle")) + ("bad-index",)
+CASES = tuple(f"{name}-{count}" for count in COUNTS for name in ("plain", "swizzle")) + ("bad-index", "half-3", "half-67", "half-128")
 
 
-def program(count, swizzle=False, bad_index=False):
+def program(count, swizzle=False, bad_index=False, half=False):
     first = {67: 64, 128: 125}.get(count, 0)
     src = (SRC / "translated_shared_count.s").read_text()
     src = "\n".join(line for line in src.splitlines() if not line.startswith("//"))
@@ -42,6 +42,14 @@ def program(count, swizzle=False, bad_index=False):
                           f"s_waitcnt lgkmcnt(0)\nv_cmp_eq_u32 vcc, {first + 2}, v26")
         src = src.replace(f"v_cmp_eq_u32 vcc, {first + 1}, v1",
                           f"v_cmp_eq_u32 vcc, {first + 1}, v26")
+    if half:
+        # Keep the launch value's high half only until a guarded widening.
+        src = src.replace("s_cmp_eq_u32 s20, 0",
+            "s_mov_b64 s[44:45], exec\nv_cmpx_gt_u32 s20, v1\n"
+            "s_cbranch_execz 2\nv_cvt_f16_f32 v7, v21\n"
+            "v_cvt_f32_f16 v7, v7\ns_mov_b64 exec, s[44:45]\n"
+            "s_cmp_eq_u32 s20, 0")
+        src = src.replace("exp pos0 v21,v22,v23,v24 done", "exp pos0 v7,v22,v23,v24 done")
     return src + "\n"
 
 
@@ -97,7 +105,7 @@ def main():
             bad = case == "bad-index"
             count = 3 if bad else int(case.split("-")[1])
             source = trial / (case + ".dxbc")
-            source.write_bytes(shader(assemble(a.llvm_mc, program(count, case.startswith("swizzle"), bad))))
+            source.write_bytes(shader(assemble(a.llvm_mc, program(count, case.startswith("swizzle"), bad, case.startswith("half")))))
             hlsl = trial / (case + ".hlsl")
             profile = trial / (case + ".profile")
             dxil = trial / (case + ".cso")
