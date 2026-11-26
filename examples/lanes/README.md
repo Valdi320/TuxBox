@@ -56,6 +56,7 @@ The game also imports Windows core API sets for services such as files, timing a
 | `wave64-shader` | A console shader that sums across 64-lane waves, translated while the game runs; not part of `all` |
 | `raster-tables` | A console vertex and pixel pair drawn under a root with two descriptor tables, reading through the second ([raster tables](#raster-tables)) |
 | `raster-samplers` | A console pixel program's literal linear sampler, under a root whose static sampler at that register is point-filtered ([raster tables](#raster-tables)) |
+| `compute-root` | Two root-less console compute programs under a root with three descriptor tables that the provider cannot reflect ([compute roots](#compute-roots)) |
 
 ```sh
 python tuxbox.py verify --only lanes-selftest --output build/lanes-selftest.json
@@ -125,6 +126,21 @@ python tuxbox.py verify --only lanes-raster-tables --output build/lanes-raster-t
 ```
 
 The suite runs on the Proton backend and removes only these programs' cache entries from the prefix.
+
+## Compute roots
+
+The `compute-root` scenario creates two root-less console compute programs (`shader_fixture.py`; not taken from any game) under a root with three descriptor tables. Without user-data records the provider cannot reflect that root, so it must translate each program against the root as given. Both programs store a word through table 1, and their FSSM records and PSV binding name that descriptor `u3, space2`, a register the root does not declare. A translation made without the root therefore cannot be bound.
+
+- The first program stores through slot 2, which the root declares as `u2, space1`. Its translation for the root writes the word to that view; a wrong view, or a stand-in that leaves the decoy, fails the scenario.
+- The second stores through slot 5, past the end of the table. The translator refuses it for this root, and the provider must give it a stand-in rather than fall back to the root-less translation.
+
+`verify` runs the scenario with the host worker. It fails if either program was translated without its root, if the second was not refused, or if the provider substituted anything but that one stand-in.
+
+```sh
+python tuxbox.py verify --only lanes-compute-root --output build/lanes-compute-root.json
+```
+
+It runs on the Proton backend and removes only these programs' cache entries from the prefix.
 
 ## Deterministic replay
 

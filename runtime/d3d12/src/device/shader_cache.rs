@@ -299,6 +299,13 @@ pub(super) fn ray_library(bytes: &[u8], source: &str) -> Option<Vec<u8>> {
     library
 }
 
+/// Whether the program is Xbox compute code without an embedded root signature,
+/// so that only the pipeline root names the register of each descriptor.
+pub(super) fn rootless_compute(shader: &[u8]) -> bool {
+    shader_code(shader) == Some((Stage::Compute, ShaderCode::Xbox))
+        && tuxbox_dxbc::Dxbc::parse(shader).is_ok_and(|dxbc| dxbc.chunk(b"RTS0").is_none())
+}
+
 pub(super) fn prepared(shader: &[u8]) -> Option<Vec<u8>> {
     let (stage, ShaderCode::Xbox) = shader_code(shader)? else {
         return None;

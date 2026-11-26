@@ -281,9 +281,25 @@ unsafe fn create_pipeline_x_inner(
                     sampler_root = Some(native);
                     (Some(code), None)
                 }
-                None => (super::shader_cache::prepared(bytes).or_else(|| {
-                    super::shader_cache::compute_with_root(bytes, root?.state.payload())
-                }), None),
+                // Only the pipeline root binds a program without an embedded one.
+                // Its root-less translation takes registers from the program's
+                // own reflection, which this root need not declare; the host then
+                // rejects the pipeline. Without a translation for the root, the
+                // stand-in keeps the translator's refusal on record.
+                None => match root {
+                    Some(r) if super::shader_cache::rootless_compute(bytes) => {
+                        let Some(code) = super::shader_cache::compute_with_root(bytes, r.state.payload()) else {
+                            super::compute_table::capture_stage_root(bytes, &r.state);
+                            crate::diagnostics::compute_failure(bytes, E_NOTIMPL.0);
+                            return unsafe { null_compute(this, Some(&r.native), desc, guest_threads, out) }
+                                .unwrap_or(E_NOTIMPL);
+                        };
+                        (Some(code), None)
+                    }
+                    _ => (super::shader_cache::prepared(bytes).or_else(|| {
+                        super::shader_cache::compute_with_root(bytes, root?.state.payload())
+                    }), None),
+                },
             }
         }
     };
