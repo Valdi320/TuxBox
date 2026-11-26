@@ -321,8 +321,43 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// Map an inline root SRV by its physical user argument, not by the
+    /// compiler's register number. FSSM's independent user row must
+    /// corroborate the used row and PSV before a pipeline root can rename it.
+    fn compute_root_raw_srv(&mut self, sgpr: u8) -> Option<u32> {
+        use crate::meta::RootParamKind;
+        let root = self.ex.root_sig.as_ref()?;
+        let mut rows = tuxbox_dxbc::compute_table::records(&self.ex.fssm)?
+            .filter(|&[class, _, _, _, loc]| class == 0x100 && (loc >> 8) & 0xff == u32::from(sgpr));
+        let [_, offset, register, shape, location] = rows.next()?;
+        if rows.next().is_some() || offset != 0 || shape != 1 || location & 0xff != 4 || sgpr >= 105 {
+            return None;
+        }
+        let mut user = tuxbox_dxbc::compute_table::user_data_records(&self.ex.fssm)?
+            .filter(|&[class, _, _, _, loc]| class == 1 && loc & 0xff == u32::from(sgpr));
+        if user.next()? != [1, 0, 2, register, location >> 8] || user.next().is_some() {
+            return None;
+        }
+        let mut raw = self.ex.resources.iter()
+            .filter(|p| p.res_type == 4 && p.lower == register && p.upper == register);
+        raw.next()?;
+        if raw.next().is_some() { return None; }
+        let param = root.params.get((location >> 16) as usize)?;
+        let RootParamKind::Descriptor { kind: 3, register: slot, space } = param.kind else { return None };
+        if param.visibility != 0 || slot >= SPACE_ALIAS { return None; }
+        // Do not change the meaning of an already allocated resource name.
+        let name = (0..16).map(|n| slot + n * SPACE_ALIAS)
+            .find(|name| self.binding_spaces.get(&(0, *name)).is_none_or(|&used| used == space))?;
+        self.binding_spaces.insert((0, name), space);
+        self.raw.insert((false, name));
+        Some(name)
+    }
+
     /// Raw SRV behind a root descriptor whose GPU address arrives in user SGPR `sgpr`.
     pub(in crate::hlsl) fn root_raw_srv(&mut self, sgpr: u8) -> Option<Res> {
+        if self.ex.stage == Stage::Compute && self.ex.root_sig.is_some() {
+            return self.compute_root_raw_srv(sgpr).map(|slot| Res::Raw(slot, false));
+        }
         let mut rows = tuxbox_dxbc::compute_table::records(&self.ex.fssm)?
             .filter(|&[class, _, _, _, loc]| class == 0x100 && (loc >> 8) & 0xff == u32::from(sgpr));
         let [_, _, register, _, _] = rows.next()?;
@@ -452,6 +487,9 @@ impl<'a> Emitter<'a> {
         if base > 124 || root > 126 || written.contains(&u16::from(root)) || written.contains(&(u16::from(root)+1))
             || format.dst != [Opnd::Sgpr(base+3)] || size.dst != [Opnd::Sgpr(base+2)]
             || high.dst != [Opnd::Sgpr(base+1)] || !raw_index::sets_byte_stride(high, root+1) { return None; }
+        if self.ex.stage == Stage::Compute && self.ex.root_sig.is_some() {
+            return self.compute_root_raw_srv(root).map(|slot| (u16::from(base), slot));
+        }
         let [binding] = &self.ex.resources[..] else { return None; };
         if binding.res_type != 4 || binding.lower != binding.upper { return None; }
         let slot = binding.lower;

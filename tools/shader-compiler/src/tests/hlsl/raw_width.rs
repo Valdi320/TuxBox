@@ -435,3 +435,70 @@ fn dynamic_cbv_rejects_incompatible_reflection_and_range_bounds() {
     ex.resources[0].upper = 31;
     assert!(Emitter::new(&ex,disassemble(&ex.isa)).resolve_resources().is_err());
 }
+
+/// Shader metadata names t5, space3, but the pipeline assigns the same
+/// root parameter to t1, space3. User SGPRs identify the physical argument.
+fn remapped_compute_root_srv() -> ShaderExtract {
+    use crate::meta::{RootParam, RootParamKind};
+    let mut ex = indexed_fixture();
+    let fixture = super::mesh::heap_extract(&[[1, 0, 2, 5, 0x30c]], 0, &ex.isa);
+    ex.fssm = fixture.fssm;
+    let used_at = (ex.fssm.len() - 16) as u64;
+    ex.fssm[0xf0..0xf8].copy_from_slice(&used_at.to_le_bytes());
+    ex.fssm[0xfc..0x100].copy_from_slice(&1u32.to_le_bytes());
+    ex.fssm.extend([0x100u32, 0, 5, 1, 0x30c04].into_iter().flat_map(u32::to_le_bytes));
+    let size = (ex.fssm.len() - 16) as u32;
+    ex.fssm[8..12].copy_from_slice(&size.to_le_bytes());
+    ex.resources[0].lower = 5;
+    ex.resources[0].upper = 5;
+    ex.resources[0].space = 3;
+    let mut root = fixture.root_sig.unwrap();
+    root.flags = 0;
+    root.params = (0..3).map(|_| RootParam {
+        visibility: 0, kind: RootParamKind::Table(Vec::new()),
+    }).collect();
+    root.params.push(RootParam { visibility: 0, kind: RootParamKind::Descriptor {
+        kind: 3, register: 1, space: 3,
+    }});
+    ex.root_sig = Some(root);
+    ex
+}
+
+#[test]
+fn compute_root_srv_uses_the_pipeline_register_not_the_shader_register() {
+    let ex = remapped_compute_root_srv();
+    let mut em = Emitter::new(&ex, disassemble(&ex.isa));
+    let binding = em.root_raw_srv(12).expect("corroborated root SRV");
+    assert!(matches!(binding, super::Res::Raw(1, false)), "{binding:?}");
+    let translated = super::translate(&ex).unwrap();
+    assert!(translated.hlsl.contains("ByteAddressBuffer raw_sbuf1 : register(t1, space3)"), "{}", translated.hlsl);
+    assert!(!translated.hlsl.contains("register(t5, space3)"));
+    assert_eq!(translated.hlsl.matches("raw_sbuf1.Load(").count(), 8);
+    println!("BEGIN_HLSL\n{}\nEND_HLSL", translated.hlsl);
+}
+
+#[test]
+fn compute_root_srv_remapping_requires_unambiguous_metadata() {
+    use crate::meta::RootParamKind;
+    for variant in 0..8 {
+        let mut ex = remapped_compute_root_srv();
+        match variant {
+            0 => ex.fssm[0xf8..0xfc].fill(0), // missing user row
+            1 => ex.resources[0].res_type = 3, // typed instead of raw
+            2 => ex.resources.push(ex.resources[0].clone()), // ambiguous PSV
+            3 => ex.root_sig.as_mut().unwrap().params[3].kind = RootParamKind::Descriptor {
+                kind: 4, register: 1, space: 3,
+            },
+            4 => ex.root_sig.as_mut().unwrap().params[3].visibility = 5,
+            5 => ex.root_sig.as_mut().unwrap().params.truncate(3),
+            6 => { let n = ex.fssm.len(); ex.fssm[n-4..].copy_from_slice(&0x30d04u32.to_le_bytes()); },
+            7 => { let n = ex.fssm.len(); ex.fssm[n-8..n-4].copy_from_slice(&2u32.to_le_bytes()); },
+            _ => unreachable!(),
+        }
+        let mut em = Emitter::new(&ex, disassemble(&ex.isa));
+        assert!(em.root_raw_srv(12).is_none(), "accepted invalid case {variant}");
+        let ops = disassemble(&ex.isa);
+        assert!(em.direct_raw_descriptor(&ops[..4], &Default::default()).is_none(), "accepted invalid case {variant}");
+        assert!(super::translate(&ex).is_err(), "translated invalid case {variant}");
+    }
+}
