@@ -103,6 +103,60 @@ PROGRAMS['mad64_chain'] = [
 ] * 16 + ['s_bcnt1_i32_b64 s20, s[30:31]', 's_bcnt1_i32_b64 s21, vcc']
 
 
+PROGRAMS['exchange_chain'] = [
+    'v_mov_b32_e32 v10, v0', 'v_mov_b32_e32 v11, v1',
+    's_mov_b32 s30, 0x76543210', 's_mov_b32 s31, 0xfedcba98',
+] + [
+    'v_add_nc_u32 v10, v10, v11 dpp8:[1,0,3,2,5,4,7,6]',
+    'v_mov_b32_dpp v11, v10 row_shr:1 row_mask:0xf bank_mask:0xf bound_ctrl:1',
+    'v_permlanex16_b32 v10, v11, s30, s31',
+    'ds_swizzle_b32 v11, v10 offset:0x041f',
+] * 16
+
+
+PROGRAMS['direct_alu_chain'] = [
+    'v_mov_b32_e32 v10, v0', 'v_mov_b32_e32 v11, v1',
+    's_mov_b32 s30, 0x12345678',
+] + [
+    'v_add_nc_u32_e32 v10, s30, v10',
+    'v_sub_nc_u32_e32 v11, v10, v11',
+    'v_subrev_nc_u32_e32 v10, v11, v10',
+    'v_not_b32_e32 v11, v11',
+    'v_xor_b32_e32 v10, v10, v11',
+    'v_lshlrev_b32_e32 v10, 5, v10',
+    'v_lshrrev_b32_e32 v11, v1, v11',
+    'v_or_b32_e32 v11, v10, v11',
+    'v_and_b32_e32 v10, 0x7fffffff, v10',
+    'v_add_nc_u32 v10, v10, v11 dpp8:[1,0,3,2,5,4,7,6]',
+    'v_mov_b32_dpp v11, v10 row_shr:1 row_mask:0xa bank_mask:0x5 bound_ctrl:1',
+] * 8
+
+
+PROGRAMS['unsigned_compare_chain'] = [
+    'v_mov_b32_e32 v10, v0', 'v_mov_b32_e32 v11, v1',
+    's_mov_b32 s40, 0x12345678',
+] + [
+    item
+    for op in ('eq', 'ne', 'lt', 'le', 'gt', 'ge')
+    for item in (
+        f'v_cmp_{op}_u32_e32 vcc, s40, v10',
+        'v_cndmask_b32_e32 v10, v11, v10, vcc',
+        f'v_cmp_{op}_u32_e64 s[30:31], v10, v11',
+        'v_cndmask_b32_e64 v11, v10, v11, s[30:31]',
+        'v_add_nc_u32_e32 v10, v1, v10',
+        's_bcnt1_i32_b64 s20, vcc',
+        's_bcnt1_i32_b64 s21, s[30:31]',
+    )
+] * 4
+
+
+# Exercise the interactions of all independently reviewed optimizations.
+PROGRAMS['combined_chain'] = sum((PROGRAMS[name] for name in (
+    'direct_alu_chain', 'carry_chain', 'mad64_chain',
+    'unsigned_compare_chain', 'exchange_chain',
+)), [])
+
+
 def assemble(llvm_mc, lines):
     result = subprocess.run([str(llvm_mc), "-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1030",
                              "-mattr=-wavefrontsize32,+wavefrontsize64", "-show-encoding"],
@@ -241,7 +295,8 @@ def step(w, text):
         cmpx = base.startswith('v_cmpx')
         if cmpx: dst, a, b = 'exec', ops[-2], ops[-1]
         else: dst, a, b = ops
-        test = {'lt': lambda x, y: x < y, 'eq': lambda x, y: x == y, 'ne': lambda x, y: x != y}[base.split('_')[2]]
+        test = {'lt': lambda x, y: x < y, 'le': lambda x, y: x <= y, 'gt': lambda x, y: x > y,
+                'ge': lambda x, y: x >= y, 'eq': lambda x, y: x == y, 'ne': lambda x, y: x != y}[base.split('_')[2]]
         mask = sum(1 << l for l in range(64) if w.active(l) and test(w.value(a, l), w.value(b, l)))
         w.store(dst, mask); return
     if base == 'v_permlanex16_b32':
@@ -296,7 +351,9 @@ def step(w, text):
             if not (rows >> (l >> 4)) & (banks >> (l & 3)) & 1 or not (valid or zero): continue
             a = first[source] if valid else 0
         x = [o[l] for o in others]
-        results[l] = {'v_mov_b32': lambda: a, 'v_add_nc_u32': lambda: a + x[0], 'v_and_b32': lambda: a & x[0],
+        results[l] = {'v_mov_b32': lambda: a, 'v_add_nc_u32': lambda: a + x[0],
+                      'v_sub_nc_u32': lambda: a - x[0], 'v_subrev_nc_u32': lambda: x[0] - a,
+                      'v_not_b32': lambda: ~a, 'v_and_b32': lambda: a & x[0],
                       'v_or_b32': lambda: a | x[0], 'v_xor_b32': lambda: a ^ x[0], 'v_max_u32': lambda: max(a, x[0]),
                       'v_lshlrev_b32': lambda: x[0] << (a & 31), 'v_lshrrev_b32': lambda: x[0] >> (a & 31),
                       'v_cndmask_b32': lambda: x[0] if (select >> l) & 1 else a,
@@ -354,7 +411,9 @@ def inputs(rng):
 def selected():
     """Each program in one console wave per group, and some in four."""
     single = [(name, body, 64) for name, body in PROGRAMS.items()]
-    return single + [(f"{name}_x4", PROGRAMS[name], 256) for name in ("saveexec", "waterfall", "permlane", "dispatch", "carry_chain", "mad64_chain")]
+    return single + [(f"{name}_x4", PROGRAMS[name], 256) for name in ("saveexec", "waterfall", "permlane", "dispatch", "carry_chain", "mad64_chain",
+                           "dpp8", "row_shift", "row_masks", "swizzle", "exchange_chain",
+                           "direct_alu_chain", "unsigned_compare_chain", "combined_chain")]
 
 
 def main(argv=None):

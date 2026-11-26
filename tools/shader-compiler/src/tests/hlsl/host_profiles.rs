@@ -105,3 +105,37 @@ fn paired_carry_uses_paired_registers_and_only_needed_mask_locals() {
     assert!(carry.contains("v10__0 = t0;"), "{carry}");
     assert!(carry.contains("v0__0"), "{carry}");
 }
+
+#[test]
+fn paired_local_exchanges_need_only_one_read_per_guest_lane() {
+    // All four instruction families select a source inside the lane's own
+    // 32-lane half. Each of these fixtures has exactly two exchange operations.
+    for name in ["dpp8", "row_shift", "row_masks", "permlane"] {
+        let (_, threads, words) = programs::PROGRAMS.iter().find(|p| p.0 == name).unwrap();
+        let hlsl = translate_paired_wave64(&program(*threads, words)).unwrap().hlsl;
+        assert_eq!(hlsl.matches("WaveReadLaneAt(").count(), 4, "{name}");
+        assert!(!hlsl.contains("tb_low"), "{name}");
+        assert!(!hlsl.contains("tb_high"), "{name}");
+    }
+}
+
+#[test]
+fn paired_simple_alu_writes_lane_registers_directly() {
+    // v_mov_b32_e32 v10, v0; v_add_nc_u32 v10, v10, v11; s_endpgm.
+    let words = [0x7e140300, 0x4a14170a, 0xbf810000];
+    let hlsl = translate_paired_wave64(&program(64, &words)).unwrap().hlsl;
+    assert!(hlsl.contains("v10__0 = v0__0;"), "{hlsl}");
+    assert!(hlsl.contains("v10__1 = v0__1;"));
+    assert!(!hlsl.contains("uint tbx_exec_lo"));
+}
+
+#[test]
+fn paired_integer_compare_emits_ballots_without_lane_shadows() {
+    // v_cmp_lt_u32_e32 vcc, 0x3e8, v0; s_endpgm.
+    let words = [0x7d8200ff, 0x000003e8, 0xbf810000];
+    let hlsl = translate_paired_wave64(&program(64, &words)).unwrap().hlsl;
+    assert!(hlsl.contains("WaveActiveBallot(0x3e8u < v0__0)"));
+    assert!(hlsl.contains("WaveActiveBallot(0x3e8u < v0__1)"));
+    assert!(!hlsl.contains("tbm_vcc_lo"));
+    assert!(!hlsl.contains("uint v0 ="));
+}

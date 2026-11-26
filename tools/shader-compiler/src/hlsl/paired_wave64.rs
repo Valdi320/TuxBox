@@ -201,19 +201,20 @@ fn read_lane(em: &mut Emitter<'_>, destination: &Opnd, source: &Opnd, leader: &s
 /// The temporary that stands for a source moved from another lane.
 const MOVED: u16 = 60000;
 
-/// Statements that set `{prefix}{lane}` to vector register `v{register}` as console lane
-/// `partner` (an expression in `tb_from`) holds it. Both host reads run in every thread.
-fn from_lane(register: u32, prefix: &str, lane: u32, partner: &str) -> [String; 3] {
+/// DPP8, DPP16 row/quad controls, permlane16 and DS swizzle only
+/// select within one 32-lane half. Read that half's VGPR directly; reading
+/// both halves and choosing at run time needlessly doubles wave operations.
+fn from_half(register: u32, prefix: &str, lane: u32, partner: &str) -> [String; 2] {
     [
         format!("uint tb_from{lane} = {partner};"),
-        format!("uint tb_low{lane} = WaveReadLaneAt(v{register}__0, tb_from{lane} & 31u), tb_high{lane} = WaveReadLaneAt(v{register}__1, tb_from{lane} & 31u);"),
-        format!("uint {prefix}{lane} = tb_from{lane} < 32u ? tb_low{lane} : tb_high{lane};"),
+        format!("uint {prefix}{lane} = WaveReadLaneAt(v{register}__{lane}, tb_from{lane} & 31u);"),
     ]
 }
 
-/// Whether console lane `tb_from{lane}` is active.
+/// Whether the source in this same half is active.
 fn source_active(lane: u32) -> String {
-    format!("(((tb_from{lane} < 32u ? exec_lo : exec_hi) >> (tb_from{lane} & 31u)) & 1u) != 0u")
+    let exec = if lane == 0 { "exec_lo" } else { "exec_hi" };
+    format!("(({exec} >> (tb_from{lane} & 31u)) & 1u) != 0u")
 }
 
 fn dpp8(em: &mut Emitter<'_>, ins: &Insn, fetch_inactive: bool) -> Result<Vec<String>, String> {
@@ -227,7 +228,7 @@ fn dpp8(em: &mut Emitter<'_>, ins: &Insn, fetch_inactive: bool) -> Result<Vec<St
     for lane in 0..2u32 {
         let me = format!("(tb_pair + {}u)", 32 * lane);
         let partner = format!("({me} & ~7u) | (({selectors:#x}u >> (3u * ({me} & 7u))) & 7u)");
-        lines.extend(from_lane(register, "tbd_", lane, &partner));
+        lines.extend(from_half(register, "tbd_", lane, &partner));
         if !fetch_inactive {
             lines.push(format!("if (!({})) tbd_{lane} = 0u;", source_active(lane)));
         }
@@ -255,8 +256,8 @@ fn dpp16(em: &mut Emitter<'_>, ins: &Insn) -> Result<Vec<String>, String> {
         // (the lane read, whether it lies inside the row)
         let (partner, inside) = match select {
             0..=0xff => (format!("({me} & ~3u) | (({select:#x}u >> (2u * ({me} & 3u))) & 3u)"), "true".to_string()),
-            0x101..=0x10f => (format!("({me} + {count}u) & 63u"), format!("({me} & 15u) + {count}u < 16u")),
-            0x111..=0x11f => (format!("({me} - {count}u) & 63u"), format!("({me} & 15u) >= {count}u")),
+            0x101..=0x10f => (format!("({me} & ~15u) | (({me} + {count}u) & 15u)"), format!("({me} & 15u) + {count}u < 16u")),
+            0x111..=0x11f => (format!("({me} & ~15u) | (({me} - {count}u) & 15u)"), format!("({me} & 15u) >= {count}u")),
             0x121..=0x12f => (format!("({me} & ~15u) | (({me} - {count}u) & 15u)"), "true".to_string()),
             0x140 => (format!("({me} & ~15u) | (15u - ({me} & 15u))"), "true".to_string()),
             0x141 => (format!("({me} & ~7u) | (7u - ({me} & 7u))"), "true".to_string()),
@@ -264,7 +265,7 @@ fn dpp16(em: &mut Emitter<'_>, ins: &Insn) -> Result<Vec<String>, String> {
             0x160..=0x16f => (format!("{me} ^ {count}u"), "true".to_string()),
             _ => return Err(format!("paired wave64: DPP16 control {select:#x}")),
         };
-        lines.extend(from_lane(register, "tbd_", lane, &partner));
+        lines.extend(from_half(register, "tbd_", lane, &partner));
         let valid = if fetch_inactive { format!("({inside})") } else { format!("({inside}) && {}", source_active(lane)) };
         lines.push(format!("bool tbo_{lane} = {valid};"));
         lines.push(format!("if (!tbo_{lane}) tbd_{lane} = 0u;"));
@@ -290,7 +291,7 @@ fn permlane(em: &mut Emitter<'_>, ins: &Insn) -> Result<(), String> {
         let me = format!("(tb_pair + {}u)", 32 * lane);
         let selector = format!("((({me} & 8u) != 0u ? {high} : {low}) >> (4u * ({me} & 7u))) & 15u");
         let partner = format!("(({me} & ~15u){across}) | ({selector})");
-        for line in from_lane(u32::from(*from), "tbp_", lane, &partner) {
+        for line in from_half(u32::from(*from), "tbp_", lane, &partner) {
             em.line(&line);
         }
     }
@@ -321,7 +322,7 @@ fn ds_swizzle(em: &mut Emitter<'_>, ins: &Insn) -> Result<(), String> {
         } else {
             format!("({me} & ~31u) | ((({me} & {}u) | {}u) ^ {}u)", mode & 31, (mode >> 5) & 31, (mode >> 10) & 31)
         };
-        for line in from_lane(u32::from(*from), "tbs_", lane, &partner) {
+        for line in from_half(u32::from(*from), "tbs_", lane, &partner) {
             em.line(&line);
         }
         em.line(&format!("if (!({})) tbs_{lane} = 0u;", source_active(lane)));
@@ -333,6 +334,142 @@ fn ds_swizzle(em: &mut Emitter<'_>, ins: &Insn) -> Result<(), String> {
     }
     em.line("}");
     Ok(())
+}
+
+/// Inline only the small integer ALU subset whose emitted body is a single
+/// predicated VGPR assignment. Both lanes have distinct storage, and no
+/// scalar or mask is written. Anything outside this closed expression grammar
+/// keeps the generic shadow-register path.
+fn direct_alu_expr(rhs: &str, lane: u32, moved: bool) -> Option<String> {
+    if !rhs.is_ascii() || rhs.contains("++") || rhs.contains("--") {
+        return None;
+    }
+    let bytes = rhs.as_bytes();
+    let mut out = String::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let start = at;
+        if bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_' {
+            while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_') {
+                at += 1;
+            }
+            let word = &rhs[start..at];
+            if is_vector_register(word) {
+                let _ = write!(out, "{word}__{lane}");
+            } else if moved && word == "tb_s60000" {
+                let _ = write!(out, "tbd_{lane}");
+            } else if word.strip_prefix('s').is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit())) {
+                out.push_str(word);
+            } else {
+                let literal = word.strip_suffix('u').unwrap_or(word);
+                let valid = if let Some(hex) = literal.strip_prefix("0x") {
+                    !hex.is_empty() && hex.bytes().all(|c| c.is_ascii_hexdigit())
+                } else {
+                    !literal.is_empty() && literal.bytes().all(|c| c.is_ascii_digit())
+                };
+                if !valid {
+                    return None;
+                }
+                out.push_str(word);
+            }
+        } else {
+            if !matches!(bytes[at], b' ' | b'\t' | b'(' | b')' | b'+' | b'-'
+                | b'*' | b'&' | b'|' | b'^' | b'~' | b'<' | b'>') {
+                return None;
+            }
+            out.push(bytes[at] as char);
+            at += 1;
+        }
+    }
+    Some(out)
+}
+
+fn direct_alu(em: &mut Emitter<'_>, ins: &Insn, code: &str, moved: Option<&[String]>, gated: bool) -> bool {
+    if !matches!(ins.mnemonic.as_str(), "v_mov_b32" | "v_add_nc_u32" | "v_sub_nc_u32"
+        | "v_subrev_nc_u32" | "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_not_b32"
+        | "v_lshlrev_b32" | "v_lshrrev_b32") {
+        return false;
+    }
+    let [Opnd::Vgpr(dst)] = ins.dst.as_slice() else { return false };
+    let mut lines = code.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with("//"));
+    let Some(statement) = lines.next() else { return false };
+    if lines.next().is_some() { return false; }
+    let prefix = format!("if (exec_lo & 1u) v{dst} = ");
+    let Some(rhs) = statement.strip_prefix(&prefix).and_then(|s| s.strip_suffix(';')) else { return false };
+    let Some(first) = direct_alu_expr(rhs, 0, moved.is_some()) else { return false };
+    let Some(second) = direct_alu_expr(rhs, 1, moved.is_some()) else { return false };
+    for (word, _) in identifiers(code) {
+        if is_vector_register(word) {
+            em.regs.insert(word.to_string());
+        }
+    }
+    if let Some(reads) = moved {
+        em.line("{");
+        for line in reads {
+            em.line(line);
+        }
+    }
+    for (lane, rhs) in [first, second].iter().enumerate() {
+        let active = lane_bit("exec_lo", "exec_hi", lane as u32);
+        let gate = if gated { format!(" & tbw_{lane}") } else { String::new() };
+        em.line(&format!("if ({active}{gate}) v{dst}__{lane} = {rhs};"));
+    }
+    if moved.is_some() {
+        em.line("}");
+    }
+    true
+}
+
+/// A simple unsigned comparison produces two ballot words directly. Keep
+/// the generic lane-local implementation for any other emitted shape,
+/// including CMPX, DPP, mask operands and aliased scalar destinations.
+fn direct_compare(em: &mut Emitter<'_>, ins: &Insn, code: &str, written: &[[String; 2]]) -> bool {
+    let op = match ins.mnemonic.as_str() {
+        "v_cmp_eq_u32" => "==",
+        "v_cmp_ne_u32" => "!=",
+        "v_cmp_lt_u32" => "<",
+        "v_cmp_le_u32" => "<=",
+        "v_cmp_gt_u32" => ">",
+        "v_cmp_ge_u32" => ">=",
+        _ => return false,
+    };
+    let [[low, high]] = written else { return false };
+    let [a, b] = ins.src.as_slice() else { return false };
+    let operand = |source: &Opnd, lane: Option<u32>| -> Option<String> {
+        match source {
+            Opnd::Vgpr(n) => Some(match lane {
+                Some(lane) => format!("v{n}__{lane}"),
+                None => format!("v{n}"),
+            }),
+            Opnd::Sgpr(_) => {
+                let value = r(source).ok()?;
+                if &value == low || &value == high { None } else { Some(value) }
+            }
+            Opnd::ConstInt(_) | Opnd::Literal(_) => r(source).ok(),
+            _ => None,
+        }
+    };
+    let (Some(a0), Some(b0)) = (operand(a, None), operand(b, None)) else { return false };
+    let expected = format!("{low} = (((exec_lo & 1u) != 0u) && ({a0} {op} {b0})) ? 1u : 0u; {high} = 0u;");
+    let actual = code.lines().map(str::trim).filter(|s| !s.is_empty() && !s.starts_with("//"))
+        .collect::<Vec<_>>().join(" ");
+    if actual != expected { return false; }
+    for (word, _) in identifiers(code) {
+        if is_vector_register(word) {
+            em.regs.insert(word.to_string());
+        }
+    }
+    em.line("{");
+    for lane in 0..2u32 {
+        // Ballot across the host wave, then intersect with guest EXEC.
+        // Both words are computed before either destination is modified.
+        let (a, b) = (operand(a, Some(lane)).unwrap(), operand(b, Some(lane)).unwrap());
+        let exec = if lane == 0 { "exec_lo" } else { "exec_hi" };
+        em.line(&format!("uint tb_cmp{lane} = WaveActiveBallot({a} {op} {b}).x & {exec};"));
+    }
+    em.line(&format!("{low} = tb_cmp0; {high} = tb_cmp1;"));
+    em.line("}");
+    true
 }
 
 pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br: Option<usize>) -> Result<(), String> {
@@ -462,6 +599,12 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br
             return Err(format!("paired wave64: {m} writes {word} outside a known mask"));
         }
     }
+    if written.is_empty() && direct_alu(em, ins, &code, moved.as_deref(), gated) {
+        return Ok(());
+    }
+    if moved.is_none() && direct_compare(em, ins, &code, &written) {
+        return Ok(());
+    }
     let names: BTreeSet<&str> = identifiers(&code).map(|(word, _)| word).collect();
     let vectors: BTreeSet<&str> = names.iter().copied().filter(|w| is_vector_register(w)).collect();
     // EXEC is needed for ballot reconstruction even when the body does
@@ -535,3 +678,7 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br
     em.line("}");
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/hlsl/paired_direct_alu.rs"]
+mod direct_alu_tests;
