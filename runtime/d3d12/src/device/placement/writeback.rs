@@ -251,6 +251,11 @@ fn write_mapped(
     range: Range<usize>,
     region: &mut (usize, MEMORY_BASIC_INFORMATION),
 ) -> Result<()> {
+    if let Some(addr) = base.checked_add(range.start)
+        && let Some(result) = super::super::heap::backing::try_write_xmem_bytes(addr as u64, &bytes[range.start..range.end])
+    {
+        return result;
+    }
     let mut at = range.start;
     while at < range.end {
         let addr = base.checked_add(at).ok_or(E_INVALIDARG)?;

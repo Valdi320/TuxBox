@@ -1,5 +1,5 @@
 //! Device memory heaps and resources sharing their native GPU allocation.
-mod backing;
+pub(in super::super) mod backing;
 mod import;
 mod shadow;
 mod virtual_place;
@@ -635,6 +635,9 @@ fn validate_shared_range(start: u64, end: u64) -> windows::core::Result<()> {
         let mut region = MEMORY_BASIC_INFORMATION::default();
         if unsafe { VirtualQuery(Some(cursor as _), &mut region, size_of_val(&region)) } == 0
             || region.State != MEM_COMMIT || region.Protect != PAGE_READWRITE {
+            if backing::is_backed_range(start, end) {
+                return Ok(());
+            }
             return Err(E_INVALIDARG.into());
         }
         cursor = (region.BaseAddress as u64).checked_add(region.RegionSize as u64).ok_or(E_INVALIDARG)?;

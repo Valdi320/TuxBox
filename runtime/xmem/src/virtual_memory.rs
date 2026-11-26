@@ -383,7 +383,15 @@ unsafe fn virtual_alloc_inner(
             unsafe { SetLastError(windows_sys::Win32::Foundation::ERROR_NOT_ENOUGH_MEMORY) };
             return ptr::null_mut();
         };
-        return super::shared_pages::reserve(address, extent);
+        let base = super::shared_pages::reserve(address, extent);
+        if !base.is_null() {
+            super::physical_pages::record_aperture_kind(
+                base.addr(),
+                extent,
+                (profile, protect) == (0x21, PAGE_READWRITE),
+            );
+        }
+        return base;
     }
     if profile == 3 {
         let host = match (allocation_type, protect) {
@@ -410,10 +418,18 @@ unsafe fn virtual_alloc_inner(
     // Reserving the aperture does not map a CPU page. GPU/cache attributes
     // take effect on the eventual backing, while its host VA stays inaccessible.
     if profile == 0x27 && allocation_type == 0x2040_6000 && protect & 0x3ff == PAGE_READWRITE {
-        return super::shared_pages::replace_aperture(address, bytes);
+        let base = super::shared_pages::replace_aperture(address, bytes);
+        if !base.is_null() {
+            super::physical_pages::record_aperture_kind(base.addr(), bytes, true);
+        }
+        return base;
     }
     if profile == 7 && allocation_type == (MEM_RESERVE | windows_sys::Win32::System::Memory::MEM_RESERVE_PLACEHOLDER) && protect == PAGE_NOACCESS {
-        return super::shared_pages::reserve(address, bytes);
+        let base = super::shared_pages::reserve(address, bytes);
+        if !base.is_null() {
+            super::physical_pages::record_aperture_kind(base.addr(), bytes, false);
+        }
+        return base;
     }
     if profile != 1 || !(plain || watched) {
         let description = format!(

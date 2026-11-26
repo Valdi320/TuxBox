@@ -1,5 +1,5 @@
 //! Queue-ordered aliases of a registered, section-backed 64 KiB page pool.
-use super::{PAGE, POOL, Pool, shared_pages};
+use super::{PAGE, POOL, PageBacking, Pool, shared_pages};
 use std::{collections::HashMap, ops::Range, slice};
 use windows_sys::Win32::Foundation::{
     ERROR_INVALID_ADDRESS, ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_SUPPORTED,
@@ -7,17 +7,17 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Memory::{MEM_RESERVE, PAGE_NOACCESS};
 
 #[repr(C)]
-struct Batch {
-    destination: usize,
-    count: u32,
-    ranges: *const PageRange,
+pub(super) struct Batch {
+    pub(super) destination: usize,
+    pub(super) count: u32,
+    pub(super) ranges: *const PageRange,
 }
 
 #[repr(C)]
-struct PageRange {
-    mode: u32,
-    source: u32,
-    count: u32,
+pub(super) struct PageRange {
+    pub(super) mode: u32,
+    pub(super) source: u32,
+    pub(super) count: u32,
 }
 
 const _: () = assert!(size_of::<Batch>() == 24 && size_of::<PageRange>() == 12);
@@ -46,13 +46,41 @@ impl Pool {
         if previous == token {
             return Ok(());
         }
+        let in_private = self.private_span(at).is_some();
+        if previous.is_some()
+            && let Some(new_token) = token
+            && in_private
+            && !self.deferred_unmaps.contains_key(&at)
+            && !self.has_hold(at, at + PAGE)
+            && !matches!(self.pages[&new_token].backing, PageBacking::SharedSection)
+        {
+            self.populate_page_bytes(new_token, at as *mut u8, true)?;
+            if let Some(prev_token) = previous {
+                self.pages.get_mut(&prev_token).expect("previous mapping valid").aliases -= 1;
+            }
+            self.pages.get_mut(&new_token).expect("new token valid").aliases += 1;
+            self.mappings.insert(at, new_token);
+            return Ok(());
+        }
         if previous.is_some() {
-            self.unmap_shared_page(at)?;
+            if in_private {
+                self.unmap_private_view_range(at, PAGE, false)?;
+            } else {
+                self.unmap_shared_page(at)?;
+            }
         }
         if let Some(token) = token {
-            let map = |pool: &mut Pool, token| match pool.map_shared_page(at, token)? {
-                true => Ok(()),
-                false => Err(ERROR_INVALID_ADDRESS),
+            let map = |pool: &mut Pool, token| {
+                let done = if matches!(pool.pages[&token].backing, PageBacking::SharedSection) {
+                    pool.map_shared_page(at, token)?
+                } else {
+                    pool.map_private_page(at, token, true)?
+                };
+                if done {
+                    Ok(())
+                } else {
+                    Err(ERROR_INVALID_ADDRESS)
+                }
             };
             if let Err(error) = map(self, token) {
                 if let Some(previous) = previous {
@@ -78,9 +106,8 @@ impl Pool {
         let mut done = 0;
         let apply = (|| {
             while let Some(first) = updates.get(done) {
-                // A linear source allocation can be represented with one OS
-                // view. Repeated tokens and discontiguous sources use separate
-                // views, so writes remain visible through every alias.
+                // Batch contiguous fresh GPU aliases into a single private
+                // placeholder allocation when none uses a SharedSection backing.
                 if first.old.is_none() && first.new.is_some() {
                     tokens.clear();
                     let mut at = first.at;
@@ -91,19 +118,13 @@ impl Pool {
                             break;
                         }
                         let Some(token) = entry.new else { break };
-                        let page = &self.pages[&token];
-                        if let Some(prior) = tokens.last() {
-                            let prev = &self.pages[prior];
-                            if !std::sync::Arc::ptr_eq(&prev.section, &page.section)
-                                || prev.offset + PAGE as u64 != page.offset
-                            {
-                                break;
-                            }
+                        if matches!(self.pages[&token].backing, PageBacking::SharedSection) {
+                            break;
                         }
                         tokens.push(token);
                         at += PAGE;
                     }
-                    if tokens.len() > 1 && self.map_contiguous(first.at, &tokens)? {
+                    if tokens.len() > 1 && self.map_private_contiguous(first.at, &tokens, true)? {
                         done += tokens.len();
                         continue;
                     }
@@ -210,7 +231,10 @@ impl Pool {
                 if !self.gpu_aliases.contains(&entry.at) && entry.old != entry.new {
                     return Err(ERROR_INVALID_ADDRESS);
                 }
-            } else if !reserved.contains(&entry.at) {
+            } else if self.private_span(entry.at).is_none()
+                && !self.deferred_unmaps.contains_key(&entry.at)
+                && !reserved.contains(&entry.at)
+            {
                 let area = shared_pages::region(entry.at)?;
                 if area.State != MEM_RESERVE || area.AllocationProtect != PAGE_NOACCESS {
                     return Err(ERROR_INVALID_ADDRESS);
@@ -227,7 +251,7 @@ impl Pool {
 // Private provider ABI. The queue passes its validated page-pool VA, synchronizes
 // outstanding GPU uses, and retains the mapping inputs until this returns.
 #[unsafe(export_name = "TuxBoxCopyPageMappings")]
-unsafe extern "system" fn copy_page_mappings(
+pub(super) unsafe extern "system" fn copy_page_mappings(
     count: u32,
     batches: *const Batch,
     source: usize,
@@ -235,7 +259,7 @@ unsafe extern "system" fn copy_page_mappings(
 ) -> i32 {
     let result = unsafe {
         array(batches, count).and_then(|batches| {
-            let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pool = super::POOL.lock().unwrap_or_else(|e| e.into_inner());
             let updates = pool.plan_batch(batches, source, pages)?;
             pool.update_aliases(&updates)
         })

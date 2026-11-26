@@ -70,6 +70,11 @@ impl CbvMirror {
         if self.mapped == 0 || self.capacity == 0 {
             return 0;
         }
+        // SAFETY: `self.mapped` points to `self.capacity` writable mapped upload bytes.
+        let dst_slice = unsafe { core::slice::from_raw_parts_mut(self.mapped as *mut u8, self.capacity) };
+        if matches!(super::super::heap::backing::try_read_xmem_bytes(self.guest, dst_slice), Some(true)) {
+            return self.capacity;
+        }
         let readable = readable_prefix(self.guest, self.capacity);
         // SAFETY: readable_prefix stopped at the first page that is not a
         // committed readable guest mapping. `mapped` covers `capacity` bytes.
@@ -241,6 +246,11 @@ impl SrvMirror {
     pub(super) fn snapshot(&self) -> usize {
         if self.mapped == 0 || self.capacity == 0 {
             return 0;
+        }
+        // SAFETY: `self.mapped` points to `self.capacity` writable mapped upload bytes.
+        let dst_slice = unsafe { core::slice::from_raw_parts_mut(self.mapped as *mut u8, self.capacity) };
+        if matches!(super::super::heap::backing::try_read_xmem_bytes(self.guest, dst_slice), Some(true)) {
+            return self.capacity;
         }
         let readable = readable_prefix(self.guest, self.capacity);
         unsafe {

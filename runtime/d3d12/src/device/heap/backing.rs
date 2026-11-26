@@ -32,10 +32,12 @@
 //! failure fails the import.
 use std::sync::OnceLock;
 use windows::Win32::Foundation::{
-    E_INVALIDARG, E_OUTOFMEMORY, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_NOT_FOUND,
-    ERROR_NOT_SUPPORTED, GetLastError,
+    E_FAIL, E_INVALIDARG, E_OUTOFMEMORY, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA,
+    ERROR_NOT_FOUND, ERROR_NOT_SUPPORTED, GetLastError,
 };
+use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::core::{HRESULT, Result, s, w};
 
 const INLINE_RUNS: usize = 16;
@@ -244,6 +246,126 @@ pub(super) fn acquire(base: u64, size: u64) -> Result<Backing> {
         AcquiredBacking::Contiguous(backing) => Ok(backing),
         AcquiredBacking::Scattered { .. } => Err(windows::Win32::Foundation::E_NOTIMPL.into()),
     }
+}
+
+fn acquired_runs(base: u64, size: u64) -> Result<Option<(Vec<BackingRun>, Hold)>> {
+    match acquire_backing(base, size)? {
+        AcquiredBacking::Contiguous(Backing { hold: None, .. }) => Ok(None),
+        AcquiredBacking::Contiguous(Backing { address, hold: Some(hold) }) => {
+            Ok(Some((vec![BackingRun { address, bytes: size }], hold)))
+        }
+        AcquiredBacking::Scattered { runs, hold } => Ok(Some((runs, hold))),
+    }
+}
+
+fn visit_xmem_runs(
+    address: u64,
+    bytes: usize,
+    mut f: impl FnMut(u64, usize, usize) -> Result<()>,
+) -> Option<Result<()>> {
+    if bytes == 0 {
+        return Some(Ok(()));
+    }
+    let Some(end) = address.checked_add(bytes as u64) else {
+        return Some(Err(E_INVALIDARG.into()));
+    };
+    let page_start = address & !0xffff;
+    let Some(page_end) = end.checked_next_multiple_of(65536) else {
+        return Some(Err(E_INVALIDARG.into()));
+    };
+    let (runs, _hold) = match acquired_runs(page_start, page_end - page_start) {
+        Ok(Some(ok)) => ok,
+        Ok(None) => return None,
+        Err(error) => return Some(Err(error)),
+    };
+    let mut guest_cursor = page_start;
+    for run in runs {
+        let Some(guest_next) = guest_cursor.checked_add(run.bytes) else {
+            return Some(Err(E_INVALIDARG.into()));
+        };
+        let copy_lo = guest_cursor.max(address);
+        let copy_hi = guest_next.min(end);
+        if copy_lo < copy_hi {
+            let len = (copy_hi - copy_lo) as usize;
+            let buf_off = (copy_lo - address) as usize;
+            let host_addr = run.address + (copy_lo - guest_cursor);
+            if let Err(err) = f(host_addr, buf_off, len) {
+                return Some(Err(err));
+            }
+        }
+        guest_cursor = guest_next;
+    }
+    Some(Ok(()))
+}
+
+pub(in super::super) fn is_backed_range(start: u64, end: u64) -> bool {
+    if end <= start {
+        return false;
+    }
+    let page_start = start & !0xffff;
+    let Some(page_end) = end.checked_next_multiple_of(65536) else {
+        return false;
+    };
+    matches!(acquired_runs(page_start, page_end - page_start), Ok(Some(_)))
+}
+
+pub(in super::super) fn try_read_xmem_bytes(address: u64, dst: &mut [u8]) -> Option<bool> {
+    visit_xmem_runs(address, dst.len(), |host_addr, buf_off, len| {
+        let mut got = 0usize;
+        unsafe {
+            ReadProcessMemory(
+                GetCurrentProcess(),
+                host_addr as *const _,
+                dst[buf_off..buf_off + len].as_mut_ptr().cast(),
+                len,
+                Some(&mut got),
+            )
+        }?;
+        if got != len {
+            return Err(E_FAIL.into());
+        }
+        Ok(())
+    })
+    .map(|res| res.is_ok())
+}
+
+pub(in super::super) fn read_guest_bytes(address: u64, dst: &mut [u8]) -> bool {
+    if let Some(ok) = try_read_xmem_bytes(address, dst) {
+        return ok;
+    }
+    if dst.is_empty() {
+        return true;
+    }
+    let mut got = 0usize;
+    let res = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            address as *const _,
+            dst.as_mut_ptr().cast(),
+            dst.len(),
+            Some(&mut got),
+        )
+    };
+    res.is_ok() && got == dst.len()
+}
+
+pub(in super::super) fn try_write_xmem_bytes(address: u64, src: &[u8]) -> Option<Result<()>> {
+    visit_xmem_runs(address, src.len(), |host_addr, buf_off, len| {
+        let mut written = 0usize;
+        unsafe {
+            WriteProcessMemory(
+                GetCurrentProcess(),
+                host_addr as *const _,
+                src[buf_off..buf_off + len].as_ptr().cast(),
+                len,
+                Some(&mut written),
+            )
+        }?;
+        if written != len {
+            return Err(E_FAIL.into());
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
